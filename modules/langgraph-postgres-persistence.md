@@ -5,7 +5,7 @@ summary: Persist chat checkpoints and hierarchical memory in Postgres with AES-2
 stack: [django, langgraph, postgres, psycopg]
 tags: [langgraph, persistence, encryption, postgres]
 requires: [aes-gcm-field-encryption]
-related_skills: []
+related_skills: [ai-chat-with-memory]
 status: stable
 updated: 2026-10-21
 ---

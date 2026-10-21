@@ -5,7 +5,7 @@ summary: Queue welcome and support-confirmation mail through Azure Communication
 stack: [python, azure]
 tags: [email, transactional]
 requires: []
-related_skills: []
+related_skills: [account-privacy-ops]
 status: stable
 updated: 2026-10-21
 ---

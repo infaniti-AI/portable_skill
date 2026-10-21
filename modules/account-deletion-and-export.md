@@ -5,7 +5,7 @@ summary: Export the signed-in user's rows as decrypted JSON, then queue a deleti
 stack: [nextjs, django, supabase]
 tags: [privacy, dsar, auth]
 requires: [m2m-jwt-service-auth, supabase-rls-client-reads]
-related_skills: []
+related_skills: [account-privacy-ops]
 status: stable
 updated: 2026-10-21
 ---

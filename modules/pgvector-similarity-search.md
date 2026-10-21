@@ -5,7 +5,7 @@ summary: Store 384-dimension embeddings and rank rows with cosine distance, cast
 stack: [django, postgres, pgvector]
 tags: [search, embeddings, pgvector]
 requires: [supabase-rls-client-reads]
-related_skills: []
+related_skills: [ai-chat-with-memory]
 status: stable
 updated: 2026-10-21
 ---

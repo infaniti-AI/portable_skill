@@ -5,7 +5,7 @@ summary: Create a Loops contact at first sign-in, emit a signup event, and run a
 stack: [nextjs, python, loops]
 tags: [crm, email, privacy]
 requires: []
-related_skills: []
+related_skills: [account-privacy-ops]
 status: stable
 updated: 2026-10-21
 ---

@@ -5,7 +5,7 @@ summary: Run a tool-calling chat graph in a Dramatiq actor and deliver tokens ov
 stack: [django, nextjs, langgraph, dramatiq, redis]
 tags: [langgraph, streaming, chat, redis, sse]
 requires: [langgraph-postgres-persistence, dramatiq-redis-workers, m2m-jwt-service-auth]
-related_skills: []
+related_skills: [ai-chat-with-memory]
 status: stable
 updated: 2026-10-21
 ---

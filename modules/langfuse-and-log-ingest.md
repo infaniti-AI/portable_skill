@@ -5,7 +5,7 @@ summary: Export chat observations to Langfuse only after structured PII is maske
 stack: [django, python, langfuse]
 tags: [observability, privacy, logging, pii]
 requires: [langgraph-streaming-chat]
-related_skills: []
+related_skills: [ai-chat-with-memory, account-privacy-ops]
 status: stable
 updated: 2026-10-21
 ---

@@ -5,7 +5,7 @@ summary: Encrypt private text with AES-256-GCM, a unique IV, and an authenticati
 stack: [django, python]
 tags: [encryption, privacy, storage]
 requires: []
-related_skills: []
+related_skills: [ai-chat-with-memory, account-privacy-ops]
 status: stable
 updated: 2026-10-21
 ---
