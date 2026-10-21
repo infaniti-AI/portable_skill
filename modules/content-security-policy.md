@@ -14,7 +14,7 @@ updated: 2026-10-21
 
 `headers()` in `next.config.ts` returns one policy for every path. The value is computed when the server process starts, from environment origins. It cannot see a per-request nonce.
 
-**P21.** Cache components prerender one HTML shell and reuse it. A nonce in that shell would have to match a CSP header that changes every request. Those two constraints disagree, so `script-src` keeps `'unsafe-inline'` and every other directive stays tight. The nonce approach is not available while `cacheComponents` is on. See `nextjs-cache-components`.
+**P21.** Cache components prerender one HTML shell and reuse it. A nonce in that shell would have to match a CSP header that changes every request. Those two constraints disagree, so `script-src` keeps `'unsafe-inline'` and there is no nonce. `style-src` also allows `'unsafe-inline'` because the UI uses inline styles. That exception is separate from the nonce problem. Do not add `'unsafe-eval'`. See `nextjs-cache-components`.
 
 The flag `SECURITY_HEADERS_ENABLED` defaults on. The string `"false"` returns an empty header list for local debugging. Any other value, including unset, sends the headers. Changing the flag means restarting the process, because `next.config.ts` reads it at load.
 
@@ -160,7 +160,7 @@ A config wrapper (error reporting, for example) must export this object rather t
 
 ## Failure prevention
 
-- **P21.** Keep `'unsafe-inline'` on `script-src` only. Do not add a per-request nonce while the shell is cached. Leave `default-src`, `object-src`, `frame-ancestors`, `frame-src`, and `connect-src` locked to known origins.
+- **P21.** Keep `'unsafe-inline'` on `script-src` (the cached shell cannot carry a nonce) and on `style-src` (inline styles). Do not add a nonce or `'unsafe-eval'`. Leave `default-src`, `object-src`, `frame-ancestors`, `frame-src`, and `connect-src` locked to known origins.
 - The header is on unless `SECURITY_HEADERS_ENABLED` is the string `false`.
 - HSTS and `upgrade-insecure-requests` are production-only.
 - Build every env origin with `URL.origin`. A failed parse contributes nothing. A DSN contributes its host, not the key in the userinfo.
@@ -177,7 +177,7 @@ Assert against the header value, not a live browser, unless a browser is already
 
 - With the flag unset, `/:path*` returns `Content-Security-Policy`, `nosniff`, `DENY`, the referrer policy, and the permissions policy.
 - `SECURITY_HEADERS_ENABLED=false` returns no security headers.
-- `script-src` contains `'unsafe-inline'` and does not contain a nonce. It does not contain `'unsafe-eval'`.
+- `script-src` and `style-src` contain `'unsafe-inline'` and do not contain a nonce. Neither contains `'unsafe-eval'`.
 - `connect-src` contains the Supabase `https` origin and the matching `wss` origin.
 - A DSN `https://public@ingest.example.com/1` contributes `https://ingest.example.com` and not `public`.
 - An unset media URL contributes no media origin.
@@ -187,7 +187,7 @@ Assert against the header value, not a live browser, unless a browser is already
 
 ## Checklist
 
-- [ ] `cacheComponents` stays on, and `script-src` uses `'unsafe-inline'` with no nonce (P21).
+- [ ] `cacheComponents` stays on. `script-src` and `style-src` use `'unsafe-inline'` with no nonce and no `'unsafe-eval'` (P21).
 - [ ] `SECURITY_HEADERS_ENABLED=false` is the only off switch. Default is on.
 - [ ] HSTS `max-age=63072000; includeSubDomains; preload` and `upgrade-insecure-requests` are production-only.
 - [ ] Origins come from `URL.origin`. DSN userinfo is not in the header. Missing media URL omits the origin.
