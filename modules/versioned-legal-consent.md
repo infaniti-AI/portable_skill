@@ -5,7 +5,7 @@ summary: Publish dated legal pages from a CMS, record the version a person accep
 stack: [nextjs, django, notion]
 tags: [legal, consent, privacy, cache]
 requires: [nextjs-cache-components, supabase-magic-link-auth]
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

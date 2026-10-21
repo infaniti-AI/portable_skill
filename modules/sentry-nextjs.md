@@ -5,7 +5,7 @@ summary: Initialize Sentry on the browser, Node server, and edge runtime, upload
 stack: [nextjs, sentry]
 tags: [observability, privacy, errors]
 requires: []
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

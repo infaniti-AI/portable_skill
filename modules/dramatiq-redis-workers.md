@@ -5,7 +5,7 @@ summary: Run async background actors on a Redis broker, cap retries at two, and 
 stack: [django, dramatiq, redis, postgres]
 tags: [workers, redis, postgres, retries]
 requires: []
-related_skills: []
+related_skills: [background-jobs]
 status: stable
 updated: 2026-10-21
 ---

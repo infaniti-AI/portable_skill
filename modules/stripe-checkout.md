@@ -5,7 +5,7 @@ summary: Create a Stripe Customer, open a hosted subscription Checkout Session, 
 stack: [nextjs, stripe, supabase]
 tags: [billing, checkout, subscriptions]
 requires: [supabase-magic-link-auth]
-related_skills: []
+related_skills: [add-stripe-billing]
 status: stable
 updated: 2026-10-21
 ---

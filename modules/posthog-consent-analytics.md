@@ -5,7 +5,7 @@ summary: Load the PostHog snippet only after the visitor accepts analytics, with
 stack: [nextjs, posthog]
 tags: [analytics, consent, privacy]
 requires: [content-security-policy]
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

@@ -5,7 +5,7 @@ summary: Turn on cacheComponents, cache public and per-user derived data with ta
 stack: [nextjs]
 tags: [cache, rendering, security]
 requires: []
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

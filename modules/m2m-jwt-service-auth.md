@@ -5,7 +5,7 @@ summary: The Next.js server signs a 60-second ES256 JWT whose sub is the Supabas
 stack: [nextjs, django]
 tags: [auth, jwt, api]
 requires: [supabase-magic-link-auth]
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

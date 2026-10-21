@@ -5,7 +5,7 @@ summary: Verify Stripe's signature on the raw body, upsert subscription state id
 stack: [django, stripe, redis]
 tags: [billing, webhooks, refunds]
 requires: [stripe-checkout]
-related_skills: []
+related_skills: [add-stripe-billing]
 status: stable
 updated: 2026-10-21
 ---

@@ -5,7 +5,7 @@ summary: Postgres roles and row level security so the signed-in Supabase client 
 stack: [supabase, postgres, django]
 tags: [rls, database, auth]
 requires: []
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

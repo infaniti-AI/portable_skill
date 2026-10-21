@@ -5,7 +5,7 @@ summary: Run the CRM scan and the account wipe once a day at a fixed UTC time on
 stack: [azure-functions, terraform, python]
 tags: [jobs, deploy, privacy]
 requires: [account-deletion-and-export, loops-crm]
-related_skills: []
+related_skills: [background-jobs]
 status: stable
 updated: 2026-10-21
 ---

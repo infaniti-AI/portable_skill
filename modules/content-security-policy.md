@@ -5,7 +5,7 @@ summary: Send a locked-down CSP and the companion security headers from Next.js,
 stack: [nextjs]
 tags: [security, csp, headers]
 requires: [nextjs-cache-components]
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

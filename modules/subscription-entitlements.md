@@ -5,7 +5,7 @@ summary: Grant the paid tier only while an active or trialing row is still insid
 stack: [django, nextjs, postgres]
 tags: [billing, entitlements, quotas]
 requires: [stripe-webhooks-refunds]
-related_skills: []
+related_skills: [add-stripe-billing]
 status: stable
 updated: 2026-10-21
 ---

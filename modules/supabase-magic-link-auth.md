@@ -5,7 +5,7 @@ summary: Passwordless email and Google sign-in that store the Supabase session i
 stack: [nextjs, supabase]
 tags: [auth, session, email]
 requires: []
-related_skills: []
+related_skills: [bootstrap-next-supabase]
 status: stable
 updated: 2026-10-21
 ---

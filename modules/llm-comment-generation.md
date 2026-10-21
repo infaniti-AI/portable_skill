@@ -5,7 +5,7 @@ summary: After a new analyzed item commits, rank companions, generate one JSON c
 stack: [django, dramatiq, litellm, postgres, pgvector]
 tags: [llm, comments, workers, embeddings]
 requires: [dramatiq-redis-workers]
-related_skills: []
+related_skills: [background-jobs]
 status: stable
 updated: 2026-10-21
 ---
