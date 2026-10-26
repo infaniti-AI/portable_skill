@@ -7,7 +7,7 @@ tags: [workers, redis, postgres, retries]
 requires: []
 related_skills: [background-jobs]
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Dramatiq workers on Redis with a per-actor database release
@@ -69,7 +69,7 @@ There is no file watcher. A new actor body is unused until this process is repla
 
 After the event loop is up, a boot hook may open other clients (the graph pool in `langgraph-postgres-persistence`) on that loop. Log a warmup failure and keep consuming. The first job then pays the cold start. Do not `sys.exit` from the hook: in-flight messages still need a consumer.
 
-Scale copies of the process by the length of the Redis list `dramatiq:default` (Dramatiq's key for the default queue). A depth of about 8 is a reasonable target per busy replica. Give the worker no HTTP ingress.
+Scale copies of the process by the length of the Redis list `dramatiq:default` (Dramatiq's key for the default queue). A depth of about 8 is a reasonable target per busy replica. The Container Apps rule that sets that target is `aca-performance-tuning`. Give the worker no HTTP ingress.
 
 ## Broker
 

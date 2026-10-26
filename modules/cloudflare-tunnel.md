@@ -14,7 +14,7 @@ updated: 2026-10-26
 
 The API process listens inside the Container Apps environment. Its ingress is internal, so the environment's public name does not route to it. A third app in that environment runs `cloudflared`. That process opens connections out to Cloudflare. Cloudflare holds the public hostname and forwards HTTP to the API's internal name. The worker has no ingress and is not on this path.
 
-Image builds, the release job, probes on the API, and the Key Vault role wait are `azure-container-apps-and-cicd`. This module is only the connector and the reason the API stays internal. The connector's own size is below. API and worker CPU, memory, and scale rules stay in that module.
+Image builds, the release job, and the Key Vault role wait are `azure-container-apps-and-cicd`. This module is only the connector and the reason the API stays internal. The connector's own size is below. API and worker CPU, memory, scale rules, and probe headers are `aca-performance-tuning`.
 
 ## Architecture
 
@@ -99,7 +99,7 @@ The secret name in Key Vault is `cloudflare-tunnel-token`. The container environ
 
 ## Host header
 
-The connector's origin request uses the internal ingress hostname as `Host`. Azure manages the certificate for that name. Production `ALLOWED_HOSTS` must include it. It must also include `localhost` and `127.0.0.1`, because API probes send `Host: localhost` (`azure-container-apps-and-cicd`).
+The connector's origin request uses the internal ingress hostname as `Host`. Azure manages the certificate for that name. Production `ALLOWED_HOSTS` must include it. It must also include `localhost` and `127.0.0.1`, because API probes send `Host: localhost` (`aca-performance-tuning`).
 
 The reference production module inlines the public name and the internal FQDN, then appends every token in `DJANGO_ALLOWED_HOSTS`. Terraform's extra-host list is what a second environment should set, and those literals in the settings file have to be replaced there. This module does not record the hostnames. Boot rejects an `ALLOWED_HOSTS` entry of `*`. The full settings overlay is `django-settings-and-env`.
 

@@ -38,7 +38,7 @@ flowchart TD
 | Worker | `python -m dramatiq run_workers --processes 1 --threads 8` | None. No HTTP probes | Redis list `dramatiq:default`, length `8`. Min 2, max 4. 1 vCPU, `2Gi` |
 | Tunnel | `cloudflared tunnel --no-autoupdate run` | None | Min 2, max 2. 0.25 vCPU, `0.5Gi`. Image tag pinned in Terraform |
 
-The variable comments require 2 GiB of memory per vCPU on Consumption. The API and the worker are 1 vCPU and `2Gi`. The tunnel is 0.25 vCPU and `0.5Gi`. The HTTP scale-rule variable describes Azure's implicit rule as 10 concurrent requests. The API sets 50 in its place.
+The variable comments require 2 GiB of memory per vCPU on Consumption. The API and the worker are 1 vCPU and `2Gi`. The tunnel is 0.25 vCPU and `0.5Gi`. The HTTP scale-rule variable describes Azure's implicit rule as 10 concurrent requests. The API sets 50 in its place. Why those sizes, the concurrency number, the queue length, the process counts, and the probe `Host` are `aca-performance-tuning`. This table only keeps them in the release picture.
 
 Revision mode is `Single`. Ingress traffic weight is `latest_revision = true` at 100 percent. A successful update deactivates the previous revision. `max_inactive_revisions` is 5. Microsoft's default keeps 100 inactive revisions; leaving the field unset retains that history.
 
