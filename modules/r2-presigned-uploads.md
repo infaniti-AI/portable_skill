@@ -1,13 +1,13 @@
 ---
 name: r2-presigned-uploads
 title: Presigned uploads to Cloudflare R2
-summary: Issue a five-minute PUT URL for a WebP object, have the browser upload it directly, and serve it from a public media host. Use this when profile images must not pass through the application server.
+summary: Issue a five-minute PUT URL for a WebP object under an unguessable key, have the browser upload it directly, and serve it from a public host that is not the host that signed the PUT. Use this when profile images must not pass through the application server.
 stack: [django, nextjs, cloudflare]
 tags: [storage, uploads, media]
 requires: [content-security-policy]
 related_skills: []
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Presigned uploads to Cloudflare R2
@@ -172,6 +172,31 @@ Persist `publicUrl` only after `put.ok`. A failed PUT does not create an object,
 
 A local preview uses `URL.createObjectURL`. `img-src` needs `blob:` for that preview. `content-security-policy` already allows it.
 
+## Public object names
+
+The read host is world-readable. Anyone who can guess the key can fetch the object. The key is the only unguessable part of the URL.
+
+Browser uploads mint the key on the server. The presign helper calls `uuid4()` and does not read a key from the request body:
+
+```text
+avatars/{uuid4()}.webp
+```
+
+The prefix names the kind of object. It is not an account. The key does not contain a user id, an email, a display name, or a counter.
+
+A replacement photo is a new key. The previous object is deleted after the new URL is stored. The PUT is signed with `Cache-Control: public, max-age=31536000, immutable` because that URL will not be reused for different bytes. The browser must send that exact header; it is part of the signature.
+
+Two hosts, two jobs:
+
+| Name | Role |
+| --- | --- |
+| `R2_ENDPOINT_URL` | S3 API. `generate_presigned_url` targets this host. The browser PUTs here |
+| `R2_PUBLIC_BASE_URL` | Read host. `public_url_for_key` joins this base and the key. No trailing slash |
+
+The public host is not the presign host. `NEXT_PUBLIC_MEDIA_BASE_URL` is the same origin as `R2_PUBLIC_BASE_URL`. Both belong in the CSP. Require the public base from the environment. A hardcoded fallback sends every environment at one site.
+
+Offline catalog imports are not this path. Profile portraits in the seed use `avatars/{profile_id}.webp`, a stable id for a catalog row. Catalog covers use a second type prefix plus a slug of the category and the file stem (`recommendations/{category}/{stem}.webp`). Those keys still must not contain a user id or an email. They are guessable on purpose so a re-seed hits the same object. They reuse the immutable cache header, so a replaced catalog object can stay stale in caches until `max-age`. Browser uploads avoid that by minting a new uuid.
+
 ## Public URL and SSRF
 
 Store the public URL. When the server must read the bytes back (a safety check) or delete the object, parse a key and then build the URL from the configured public base. Never `GET` the host the caller sent.
@@ -258,7 +283,7 @@ The PUT is cross-origin. The bucket needs a CORS rule that allows the app origin
 
 ## Tests
 
-Stub `generate_presigned_url` and assert the params: bucket, key ending in `.webp` under `avatars/`, `ContentType` `image/webp`, the immutable cache header, expiry 300. Assert the client config uses `s3v4`, path addressing, and `when_required` for both checksum settings. A missing endpoint raises the config error and the route returns 500.
+Stub `generate_presigned_url` and assert the params: bucket, key ending in `.webp` under `avatars/`, `ContentType` `image/webp`, the immutable cache header, expiry 300. The key matches `avatars/<uuid>.webp` and does not contain the user id or an email. A body field named `key` does not change it. Assert the client config uses `s3v4`, path addressing, and `when_required` for both checksum settings. A missing endpoint raises the config error and the route returns 500. `publicUrl` uses `R2_PUBLIC_BASE_URL`, and `uploadUrl` is the presigned host.
 
 Parse tests: a public-base URL yields `avatars/<file>`; a legacy `/object/public/avatars/<file>` URL yields the same key and the download uses the configured host; `/images/...` and a foreign host yield nothing; a key with `..` is rejected.
 
@@ -272,6 +297,8 @@ API: no user is 401; a create over the quota is 403; a profile id the user does 
 - [ ] Client uses path style, `s3v4`, region `auto`, and `when_required` checksums.
 - [ ] Bucket CORS allows PUT with `Content-Type` and `Cache-Control` from the app origin.
 - [ ] CSP lists the R2 API host and the media origin.
+- [ ] Browser keys are `avatars/{uuid}.webp`. No user id, email, or client-supplied key. Catalog keys use a stable asset path and still omit account ids.
+- [ ] `R2_PUBLIC_BASE_URL` and `R2_ENDPOINT_URL` are different hosts. The immutable cache header is on the signed PUT.
 - [ ] Browser caps are 5 MiB in, 1024 px, WebP, 200 KiB out.
 - [ ] PUT uses the signed headers. The public URL is saved only after HTTP 200.
 - [ ] Downloads use the configured host. Deletes are best-effort and cover a rejected save.
