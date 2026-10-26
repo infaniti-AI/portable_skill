@@ -7,7 +7,7 @@ tags: [deploy, ci, containers]
 requires: [migration-safety]
 related_skills: []
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Container Apps release with GitHub OIDC
@@ -244,7 +244,7 @@ Trigger: pull request to `main`. Python 3.13.
 
 | Job | What it runs |
 | --- | --- |
-| Lint | `black==26.5.1 --check`, `isort==8.0.1 --check-only`, `flake8` with `--select=E9,F63,F7,F82` only |
+| Lint | `black==26.10.1 --check`, `isort==8.0.1 --check-only`, `flake8` with `--select=E9,F63,F7,F82` only |
 | Migration safety | `migration-safety` `--names` path. Checkout `fetch-depth: 0` |
 | Security | `pip-audit -r requirements.txt --strict`, then `bandit -r` on the application packages at high severity and high confidence (`-ll -ii`) |
 | Unit | `pytest tests/unit/ -m "unit and not slow"`, coverage of the application packages, `--cov-fail-under=70` |
@@ -254,7 +254,7 @@ Trigger: pull request to `main`. Python 3.13.
 
 The unit job supplies a throwaway `FIELD_ENCRYPTION_KEY` (64 hex characters) and a throwaway `M2M_JWT_PUBLIC_KEY`. Generate them for CI. They are not the production secrets and they are not pasted into this module.
 
-The integration job is skipped when `github.event.pull_request.head.repo.full_name` is not this repository, so a fork pull request does not start the local stack. `supabase stop --no-backup` is `if: always()`. The CLI action in the reference uses `version: latest`. Pin a CLI version so a new release does not change the database under the tests.
+The k6 harness is not a job in this workflow or in the release workflow (`k6-backend-load`). The integration job is skipped when `github.event.pull_request.head.repo.full_name` is not this repository, so a fork pull request does not start the local stack. `supabase stop --no-backup` is `if: always()`. The CLI action in the reference uses `version: latest`. Pin a CLI version so a new release does not change the database under the tests.
 
 `pip-audit` may carry a temporary `--ignore-vuln` while a dependency pin blocks the fix. The advisory id and the pin that forces it belong in a comment on that step. Remove the ignore when the pin lifts. Coverage upload uses `fail_ci_if_error: false`.
 

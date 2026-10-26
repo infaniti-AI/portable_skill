@@ -129,7 +129,7 @@ The unit coverage config omits migrations, tests, HTTP handlers, middleware, URL
 
 The integration job needs the unit job. It is skipped when the pull request comes from a fork. It installs a Postgres client and Redis, starts Redis, starts the local Supabase CLI, migrates with the test settings module, runs `setup_langgraph_persistence`, then `pytest tests/integration/` with coverage and no fail-under. `REDIS_URL` is `redis://127.0.0.1:6379/0`. Supabase is stopped with `--no-backup` even when the tests fail. Coverage upload does not fail the job.
 
-Formatter, migration-safety, and the dependency audit are other jobs in the same workflow. They are not this suite. Release order is `azure-container-apps-and-cicd`. The load harness is not a CI job.
+Formatter, migration-safety, and the dependency audit are other jobs in the same workflow. They are not this suite. Release order is `azure-container-apps-and-cicd`. The load harness is not a CI job (`k6-backend-load`).
 
 ## Failure prevention
 
