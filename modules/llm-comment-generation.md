@@ -7,7 +7,7 @@ tags: [llm, comments, workers, embeddings]
 requires: [dramatiq-redis-workers]
 related_skills: [background-jobs]
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Delayed companion comments from one completion
@@ -105,25 +105,15 @@ score = 1.0 * relevance
 
 The 3-day set excludes the current item. Its cutoff is the item's own timestamp, not the server clock. Weights live in settings: `COMMENT_RELEVANCE_WEIGHT`, `COMMENT_LIKED_WEIGHT`, `COMMENT_RANDOM_WEIGHT`, `COMMENT_RECENT_PENALTY`.
 
-`BETA_TESTING` makes `get_user_subscription_tier` return `premium` for every user. Default is false. Only the string `premium` takes the large wave. Any other tier, including `free`, takes the small wave.
+The caller supplies the shortlist cap and the memory limits: a recent window, a recent count, and a similar count. One completion covers every companion on that shortlist. The inserts are separate delayed actors.
 
-A showcase item uses the premium wave and the premium memory limits while the account tier stays what it was. Showcase is the first analyzed item of that local calendar day, written while server `now` is still inside 7×24 hours after signup. The flag stays on the row after the week. Edits never set it.
+A boolean window flag on the item selects the larger cap and the larger memory limits. The account tier stored for billing stays what it was. The save handler sets the flag on a new analyzed item when the caller says this item qualifies. Edits do not set it. Without the flag, the caller uses the smaller cap. An empty shortlist returns before the completion.
 
-Premium wave, hard cap 20:
+The save handler's quota gate decides whether this actor is enqueued. A create that skipped extraction does not enqueue it. This module does not count that quota.
 
-- More than 15 connected: 15 random connected, plus up to 5 random rows from the full re-ranked unconnected list.
-- Otherwise: every connected companion, plus the top of a `Normal(10, 3)` sample clipped to `[5, 15]`, and only as many as `20 - connected`.
+Do not hardcode two sample sizes or a signup-duration rule here. The product that calls the ranker owns those numbers. `BETA_TESTING`, when true, makes tier resolution return the larger-cap tier for every user. Default is false.
 
-Free wave: one random connected companion if any exist, plus the first row of that normal sample. If nobody is connected and the sample has at least two rows, take two strangers. If the shortlist is empty, return.
-
-Memory injected into the prompt follows the comment tier, not a separate flag:
-
-| Tier | Recent window | Recent cap | Similar |
-| --- | --- | --- | --- |
-| free | 7 days | 1 | on, limit 1 |
-| premium | 30 days | 5 | on, limit 3 |
-
-Recent rows are `datetime >= item_time - window`, newest first, then sliced to the cap. The current item is removed. Similar rows use cosine similarity `1 - distance >= 0.6`, the tier limit, and no date predicate (`days` left unset). Exclude the recent ids and the current id. On this query, a set `days` means "strictly older than N days", which is the wrong window for comments. Leave it unset.
+Recent rows are `datetime >= item_time - window`, newest first, then sliced to the caller-supplied recent cap. The current item is removed. Similar rows use cosine similarity `1 - distance >= 0.6`, the caller-supplied similar cap, and no date predicate (`days` left unset). Exclude the recent ids and the current id. On this query, a set `days` means "strictly older than N days", which is the wrong window for comments. Leave it unset.
 
 `reference_now` for those cutoffs is the item's stored timestamp. Reject a null timestamp before computing cutoffs. Do not substitute the server clock.
 
@@ -158,7 +148,7 @@ Use one `UPDATE` with `F("related_comments_count") + 1`. A load-add-save loses i
 
 `item_comments`: uuid id, item id, companion id, encrypted comment text, `created_at`, `updated_at`. No uniqueness on the pair.
 
-`items.last_comment_read_at` is the read marker. `items.showcase` is the first-week flag. `items.embedding` is `vector(384)`.
+`items.last_comment_read_at` is the read marker. A boolean window flag on the item selects the larger cap. `items.embedding` is `vector(384)`.
 
 Companion columns used here: `embedding`, `metadata` (category, function, tagline, description, personality), `likes_count`, `related_comments_count`, `is_custom`, `is_published`, `is_paused`, `is_deleted`, `created_by_user_id`.
 
@@ -170,7 +160,7 @@ Companion columns used here: `embedding`, `metadata` (category, function, taglin
 
 - A numpy vector fails `if embedding` and passes `is not None` plus `len` (P12).
 - An empty shortlist returns and does not call the model.
-- Premium with 16 connected and at least 5 unconnected rows yields 20 commenters. Premium with 2 connected stays at or under 20. Free yields at most 2.
+- The larger cap stays at or under the caller-supplied limit. The smaller cap stays under that limit. An empty shortlist does not call the model. The window flag selects the larger cap and does not change the stored account tier.
 - Index 0 is never in the surprise set. Delay 0 becomes `delay=0`.
 - A fenced JSON array parses. An empty array raises.
 - Primary failure then fallback success returns the fallback text. Both failing raises.
@@ -182,10 +172,10 @@ Companion columns used here: `embedding`, `metadata` (category, function, taglin
 
 - [ ] Generation is enqueued only for a new item that was analyzed.
 - [ ] Vector guards use `is not None` and length. The ORM boundary stores a Python list (P12).
-- [ ] Ranking weights and the 20-comment cap match the tier table. Showcase uses the premium path only.
+- [ ] Ranking weights apply before the cap. The caller supplies the shortlist cap and the memory limits. The window flag selects the larger cap.
 - [ ] Recent and similar cutoffs use the item timestamp. Similar search does not set `days`.
 - [ ] Prompt trims excerpts first, then drops similar rows, then newest recent rows.
 - [ ] Completion tries primary, then one fallback, with thinking flags per provider.
 - [ ] First insert is immediate. One or two later inserts wait 6–12 hours. Dramatiq delay is milliseconds.
-- [ ] Comment text is encrypted. The counter increment is atomic. A second generation does not insert another wave.
+- [ ] Comment text is encrypted. The counter increment is atomic. A second generation does not insert another shortlist.
 - [ ] The worker process was restarted after the actor change (P04).

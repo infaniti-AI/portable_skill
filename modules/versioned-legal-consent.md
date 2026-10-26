@@ -7,7 +7,7 @@ tags: [legal, consent, privacy, cache]
 requires: [nextjs-cache-components, supabase-magic-link-auth]
 related_skills: [bootstrap-next-supabase]
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Versioned terms and privacy consent
@@ -42,7 +42,7 @@ sequenceDiagram
 
 ## Published documents
 
-`NOTION_API_KEY` is the only secret. The Notion API version header is `2022-06-28`. Each document is a parent page. Each published version is a child page whose title matches `^\d{4}-\d{2}-\d{2}$`. List children with `GET /v1/blocks/{id}/children`, `page_size` 100, following `next_cursor`. A non-OK response throws. Do not catch that throw inside `"use cache"`.
+`NOTION_API_KEY` is the only secret. The Notion API version header is `2022-06-28`. Each document is a parent page. Each published version is a child page whose title matches `^\d{4}-\d{2}-\d{2}$`. List children with `GET /v1/blocks/{id}/children`, `page_size` 100, following `next_cursor`. A non-OK response throws. Do not catch that throw inside the cached loader.
 
 A child is Ready when its markdown contains `**Status:** Ready for site` or `Status: Ready for site`. Drop those lines from the body, and drop a line that is only `**Effective:** YYYY-MM-DD` or `Effective: YYYY-MM-DD`. Keep the intro and the sections. Do not cut the body at the first heading. That cut belongs to the article helper, not to legal pages.
 
@@ -55,7 +55,11 @@ function selectVersion(dates: string[], requested?: string): string | null {
 }
 ```
 
-The public page calls this with no requested date, so it always renders the latest Ready child. Older children stay in the CMS. The acceptance version is `max(latest Ready privacy date, latest Ready terms date)`, compared as strings. `YYYY-MM-DD` sorts in calendar order. Do not store a localized display date as the version.
+The cached library keeps one body per document: the newest Ready child. Walk dated children newest-first and stop at the first Ready body. Older dated children stay in the CMS and are not stored. A newer child that is not Ready is skipped, so an older Ready child can still be the one stored. The public page renders that stored body. It does not choose among a list of dates.
+
+`selectVersion` still returns the latest date in a list, or the requested date when that child is in the list. The loader does not call it.
+
+The acceptance version is still the later of the two current dates, privacy and terms, compared as strings. `YYYY-MM-DD` sorts in calendar order. Do not store a localized display date as the version.
 
 Display a version with `Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: "long", day: "numeric", year: "numeric" })`.
 
@@ -63,12 +67,14 @@ Rewrite links that start with the configured site origin to a path. The referenc
 
 ### Cache (P20)
 
-The library loader is `"use cache"`, `cacheLife("forever")`, and `cacheTag("legal-content")`. Profiles and the revalidate route are `nextjs-cache-components`.
+The library loader is `"use cache: remote"`, `cacheLife("forever")`, and `cacheTag("legal-content")`. Profiles and the revalidate route are `nextjs-cache-components`. Plain `"use cache"` is one process (P39). Shared legal bodies use the remote handler.
 
 | Outcome | What the cache stores |
 | --- | --- |
 | Notion HTTP error | Nothing. The throw leaves the function. |
-| Child not Ready | The library without that child, until `legal-content` is revalidated. |
+| Newest Ready child | `{ date, markdown }` for that document only. Older dated children are not stored. |
+| Newer child not Ready | That child is skipped. The walk continues to the next older dated child. |
+| No Ready child | The document is absent from the library. |
 | `NOTION_API_KEY` empty | `{}`. That empty object is cached for the `forever` profile. |
 
 An empty library makes the current version null. Sign-in then uses the fallback date, and the dialog stays closed (`needsUpdate` is false when the current date is missing). After the key is set, revalidate `legal-content` or the empty result keeps serving. Publishing a new Ready child also requires that revalidate. Until then the dialog and the public page keep the previous library.
@@ -206,7 +212,7 @@ The dialog is not a hard gate. A local record `{ day, version, shownAt }` is key
 
 - `needsUpdate("2026-01-01", "2026-01-01")` is false. An older accepted date is true. Null accepted with a current date is true. Null current is false. A non-date on either side follows those two null rules.
 - `selectVersion` returns the latest date, or the requested date when that child exists. A title that is not `YYYY-MM-DD` is ignored. A page without the Ready line is ignored. The body has no status line and no effective line, and still has the intro.
-- The current version is the later of the latest Ready privacy date and the latest Ready terms date. A cookies page with a later date does not change it.
+- The cached library stores the newest Ready version of each document. Older dated children are not stored. The current version is the later of those two dates, privacy and terms. A cookies page with a later date does not change it.
 - The consent API returns 201 on the first insert and 200 on the same triple, with `withdrawn_at` cleared. A non-date version and any other `consent_type` are 400. A missing subject is 400, not 500.
 - The prompt record hides the dialog for the rest of the local day, shows it the next local day, shows it the same day when the version string changes, and is removed after a successful accept.
 - A cookie that is missing records nothing. Malformed JSON posts the fallback date. The callback deletes the cookie. A failed POST is not treated as success.
@@ -215,7 +221,7 @@ The dialog is not a hard gate. A local record `{ day, version, shownAt }` is key
 ## Checklist
 
 - Privacy and terms Ready dates are the only inputs to the acceptance version. Comparison is string order on `YYYY-MM-DD`.
-- The library is cached with `legal-content`. HTTP errors throw. An empty key result is revalidated after the key exists (P20).
+- The library is `"use cache: remote"` with `legal-content`, and it stores only the newest Ready body per document (P39). HTTP errors throw. An empty key result is revalidated after the key exists (P20).
 - Seeders call `unstable_rethrow` before a null fallback.
 - The sign-in action refuses to start auth without `legal_acceptance=true`, then sets an httpOnly cookie for one day.
 - The callback posts `terms_privacy` with the user id from the JWT, checks the response, and deletes the cookie.

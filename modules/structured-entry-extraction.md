@@ -7,7 +7,7 @@ tags: [llm, extraction, insights, goals]
 requires: [llm-comment-generation]
 related_skills: []
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Structured extraction, goal progress, and a five-week insights cache
@@ -42,9 +42,9 @@ flowchart TD
 
 SSE events are `progress`, then `success` with the item id, or `error`. Analysis failure stops before the embedding and writes nothing. Embedding failure stops before the write. The client can save again.
 
-Creates check the analysis quota. Updates always extract. The free cap is one analyzed item per local calendar day. Premium is unbounded. The count is rows for that user whose stored timestamp falls on that local day and whose `sentiment_score` is not null. Over the cap, the create still embeds and saves, with extraction skipped. Skipped extraction means empty topics, keywords, people, and analysis, a null sentiment, no comment job, and no goal links.
+Creates pass a quota gate. Updates always extract. The gate counts rows for that user whose stored timestamp falls on that local day and whose `sentiment_score` is not null. The caller supplies the cap. Over the cap, the create still embeds and saves, with extraction skipped. Skipped extraction means empty topics, keywords, people, and analysis, a null sentiment, no comment job, and no goal links.
 
-Showcase, for comment tier only: a new analyzed save by a non-premium account, server `now` still inside 7×24 hours after signup, and no other item already stored on that local calendar day. The check is existence, then the flag is stored on the row.
+A boolean window flag on the item selects the larger comment cap (`llm-comment-generation`). The save handler sets it on a new analyzed item when the caller says this item qualifies, after checking that no other item is already stored on that local calendar day. Edits never set it. Do not encode a signup-duration rule in this module.
 
 Resolve the row before the model call. A create with a blank title uses the first readable line of the body: strip tags, collapse whitespace, 60 characters, ellipsis if cut, or "Untitled" when nothing remains. An update keeps the stored calendar day. Its title becomes the incoming title, else the stored title, else that same fallback. The model may replace the title later.
 
@@ -114,7 +114,7 @@ Stored object:
 
 Generated title comes from the raw object, collapsed whitespace, 60 characters. It replaces the placeholder when present. Detect language with `langid` on the body for later keyword tokenization. On failure log a warning and leave language null.
 
-Copy denormalized `topics`, `keywords`, and `people` names onto the row as well as the full object. Encrypt those JSON values and the title and body. Leave `sentiment_score`, the vector, language, and `showcase` as plain columns.
+Copy denormalized `topics`, `keywords`, and `people` names onto the row as well as the full object. Encrypt those JSON values and the title and body. Leave `sentiment_score`, the vector, language, and the window flag as plain columns.
 
 Embed the raw body, not the JSON. A wrong dimension raises and the save stops. Guard the stored vector with `is not None` and `len` before any later similarity call (P12). Do not use the vector as a boolean.
 
@@ -157,7 +157,7 @@ A new goal starts as `{"summary": "", "feedback": {"score": 0, "feedback": "", "
 
 An item is inside the window when its stored timestamp is greater than or equal to that start. Align naive and aware values before comparing. Chart code compares with timezones stripped. The dirty check uses the same start.
 
-Charts do not call a model. The stats route requires `X-Client-Local-Time` and returns counts, scores, and refs (`id`, title, timestamp). It does not return bodies. It is not premium-gated. The browser recomputes the same window from items it already holds. Share the week count and the Monday start. The two payloads are not field-identical: the server keeps 8 topics and 12 people, and leaves a missing topic empty; the browser chart helper does not apply that topic cap and substitutes a fallback topic label.
+Charts do not call a model. The stats route requires `X-Client-Local-Time` and returns counts, scores, and refs (`id`, title, timestamp). It does not return bodies. Chart numbers are not behind the quota gate. The browser recomputes the same window from items it already holds. Share the week count and the Monday start. The two payloads are not field-identical: the server keeps 8 topics and 12 people, and leaves a missing topic empty; the browser chart helper does not apply that topic cap and substitutes a fallback topic label.
 
 Server chart keys: `entriesInRange`, `emotionHabitat`, `topicLandscape`, `peopleBubbles`, `attentionSeries`, `selfFocus`, `insightRate`, `cognitiveAverages`, `needsWeekly`, `needsCurrent`, `needsFrustrated`, `relationshipCards` (4), `triggerChainCount`, `narrativeSplit`. Only rows with `analysis.emotion` are analyzed. Habitat, topics, and people ignore the rest. Word counts strip tags. Lifetime streaks and a 21-day grid are a different route. They do not use this window.
 
@@ -167,7 +167,7 @@ GET returns the cache when `generated_at` is set, the dirty flag is clear, and `
 
 POST regenerates. Read `updated_at`, compose, then update only where `updated_at` still matches. Clear dirty and store the window start in that same update. Two attempts. If both miss, return empty prose with `stale: true` and `has_cache: true`. Marking dirty sets the flag and moves `updated_at`, which is what makes an in-flight commit miss. Create the row when it does not exist. On a unique-constraint race, update the existing row.
 
-Compose loads items from `reference_now` back across the span of the window (`(reference_now - start).days + 1`), then keeps timestamps at or after the start. Premium uses every row in that set. A free account whose signup is still inside 7×24 hours generates with showcase rows only. After that week, GET is an empty locked payload and POST is 403. Chart numbers stay available.
+Compose loads items from `reference_now` back across the span of the window (`(reference_now - start).days + 1`), then keeps timestamps at or after the start. The window flag selects the larger set: that path uses every row in the window. The smaller path keeps only rows that carry the flag. When the caller refuses generation, GET is an empty locked payload and POST is forbidden. Chart numbers stay available.
 
 Each model row is an index, timestamp, title, a 1200-character body excerpt, and the structured fields. The prompt tells the model to work from that payload. The excerpt is still in the payload. Input cap is 32_000 tokens. While over the cap and more than one row remains, drop the front row and rebuild. The window list is newest-first, so that drop removes the newest excerpt and keeps older rows. `complete` at `temperature=0.3`, `max_tokens=4096`, thinking off, English strings. Clip after parse: narrative reading 45 words, cognitive reading 32, each relationship note 30, at most 8 notes. Empty window stores empty strings plus `generated_at` and does not call the model.
 
@@ -175,19 +175,19 @@ Cache keys: `summary`, `feedback`, `rumination_loops`, `trigger_groups` (`events
 
 ## Environment
 
-Same LLM variables as `llm-comment-generation`. `REDIS_URL` for the goal actor. `BETA_TESTING` changes the tier that selects the analysis cap and the insights gate, because tier resolution returns premium for every user when it is true. Headers: `X-Client-Local-Time`, `X-User-Created-At`.
+Same LLM variables as `llm-comment-generation`. `REDIS_URL` for the goal actor. `BETA_TESTING`, when true, makes tier resolution return the larger-cap tier for every user, which selects the analysis quota and the insights gate. Headers: `X-Client-Local-Time`, `X-User-Created-At`.
 
 ## Tests
 
 - A vector used as a boolean raises. `is not None` and `len` accept the same value (P12).
-- Over the free daily cap, a create saves with null sentiment and does not enqueue comments. An update still extracts.
+- Over the caller-supplied quota, a create saves with null sentiment and does not enqueue comments. An update still extracts.
 - A goal title the user does not have is dropped. Matching is case-insensitive.
 - A fenced extraction object parses. A non-object becomes an error event and no row.
 - The goal prompt over 8_000 tokens keeps the newest related items and trims from the end of a body, never by half.
 - Window start for a Wednesday is the Monday four weeks before this week's Monday. A timestamp on the previous Monday is inside. One second earlier is outside.
 - A save inside the window sets dirty and moves `updated_at`. A commit that still has the old timestamp writes. A commit after the bump does not, and the second miss returns `stale`.
 - GET while dirty returns empty prose and leaves the stored blob in place.
-- Showcase-only generation excludes non-showcase rows. A free account outside the 7-day window gets 403 on POST.
+- Flagged-only generation excludes rows that do not carry the window flag. When the caller refuses generation, POST is forbidden.
 
 ## Checklist
 
@@ -195,6 +195,7 @@ Same LLM variables as `llm-comment-generation`. `REDIS_URL` for the goal actor. 
 - [ ] Analysis failure and embedding failure leave no new row. A skipped analysis still embeds.
 - [ ] Topics, roles, needs, and goals are closed sets. Sentiment is 0–100 from the raw field or from valence.
 - [ ] JSON columns and the body are encrypted. The vector is a Python list before any boolean test (P12).
+- [ ] The quota cap is supplied by the caller. The window flag selects the larger comment cap and the larger insights set.
 - [ ] Comments enqueue only for a new analyzed item. Goal progress enqueues per linked id and replaces `ai_analysis` only after the shape check.
 - [ ] Insights use five Monday-start weeks on the client clock, on the server and in the browser.
 - [ ] Dirty bumps `updated_at`. The commit is conditional on that timestamp. Stale reads do not pretend the cache is empty of history.
