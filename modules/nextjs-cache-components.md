@@ -1,37 +1,61 @@
 ---
 name: nextjs-cache-components
 title: Next.js 16 cache components and tagged invalidation
-summary: Turn on cacheComponents, cache public and per-user derived data with tags, and leave cookie-backed mutable reads as Suspense holes. Use this when a Next.js 16 app must prerender a static shell without serving stale per-user detail.
+summary: Turn on cacheComponents, store shared and derived reads in the remote cache with tags, and leave cookie-backed mutable reads as Suspense holes. Use this when a Next.js 16 app must prerender a static shell without serving stale per-user detail.
 stack: [nextjs]
 tags: [cache, rendering, security]
 requires: []
 related_skills: [bootstrap-next-supabase]
 status: stable
-updated: 2026-10-21
+updated: 2026-10-26
 ---
 
 # Next.js 16 cache components and tagged invalidation
 
-Next.js 16.3 with `cacheComponents: true` prerenders a static shell. Cookie and search-param reads become dynamic holes wrapped in `<Suspense>`. `"use cache"` stores the return value of a function until a tag is invalidated or the `cacheLife` profile expires. Route segment config `dynamic`, `revalidate`, and `fetchCache` is not the control. Official Next.js 16 docs replace those exports with `"use cache"`, `cacheLife`, and `connection()`.
+Next.js 16 with `cacheComponents: true` prerenders a static shell. Cookie and search-param reads become dynamic holes wrapped in `<Suspense>`. A `"use cache"` directive stores the return value of an async function until a tag is invalidated or the `cacheLife` profile expires. Route segment config `dynamic`, `revalidate`, and `fetchCache` is not the control. Official Next.js 16 docs replace those exports with `"use cache"`, `cacheLife`, and `connection()`.
 
 `React.cache()` is a different tool. It dedupes a call inside one server render. It does not survive the next request.
 
-## What is cached
+The app on disk is Next.js 16.3. The handler names below match the current Next.js docs (`use cache` versus `use cache: remote`, `revalidateTag` profile `"max"`, `updateTag`, and `{ expire: 0 }`).
 
-| Data | Cache | Tag |
+## What may be cached
+
+Three kinds of read may use `"use cache: remote"` plus `cacheLife` and `cacheTag`.
+
+- **Shared published content.** Many requests need the same body, and it changes only when an editor publishes. One function, one short tag, no user id. A draft is an intentional miss: return null and filter it out. That absence is stored until the tag is invalidated, so publishing includes a revalidate of the shared tag.
+- **Derived lists.** The result is expensive, and it changes when an upstream vector or catalog changes, not on every create or delete of the source item. Pass the user id and every limit that changes the payload as arguments. Put the user id in the tag so one user's write does not expire every user.
+- **A public catalog that is identical for every caller.** Fetch it with a service subject inside the cached function. The token is not an argument, so it is not part of the key. See `m2m-jwt-service-auth`.
+
+**P39.** Plain `"use cache"` (no handler) is the in-memory cache of one server process. Official docs: that entry is not shared with the next instance, so a later request often misses and calls the origin again. Shared entries use `"use cache: remote"`. The remote handler is shared across instances. It costs a network lookup. The reference config does not set `cacheHandlers`; it relies on the host's built-in `remote` handler. A host that does not provide one needs `cacheHandlers.remote`.
+
+> NOTE: unverified whether a non-platform host errors or silently falls back when `cacheHandlers.remote` is unset. The directive name in the repo and in the docs is `remote`.
+
+`"use cache: private"` is a different handler. It may read cookies and is scoped to one browser. It does not fill the shared server cache. Use it only when the cached function must see request headers. A derived list keyed by a user id argument stays on `remote`.
+
+These reads stay ordinary request fetches. Do not put them in `"use cache"` or `"use cache: remote"`.
+
+- Item detail. A note can be inserted after the save, and a cached document would hide it (P18).
+- The item list. It changes on create and delete.
+- Message pages. They churn too fast for a year-long entry.
+- A lookup of a job that is still running.
+- Any function that calls `cookies()` or `headers()`.
+
+## How to choose a tag and a key
+
+Arguments and closed-over values are part of the cache key. Two `limit` values are two entries even when they share a tag. Pass every input that changes the result as an argument. A literal inside the function is not part of the key: editing it does not create a new entry until the tag is invalidated or the profile expires.
+
+| Invalidation set | Tag shape | Who expires it |
 | --- | --- | --- |
-| Public catalog from the API, using a service subject | `"use cache"` + profile `forever` | `platform-audiences` |
-| Per-user recommendation lists | `"use cache"`, argument is the user id | `audience-recommendations-<userId>`, `recommendations-<userId>` |
-| Published legal and SEO bodies | `"use cache"` + `forever` | `legal-content`, `seo-content` |
-| Item list, item detail, notes, message pages | Uncached request fetch | None |
+| One published library | a short stable name, `published-pages` | the secret revalidate route |
+| One user's derived lists | a prefix plus the user id, `derived-${userId}` | the server action that knows the user id |
 
-Detail stays uncached because a note can be inserted after the save, and a cached document would hide it (P18). The list changes on create and delete. Message pages churn too fast to be worth a year-long entry. The code comments state both choices.
+`cacheTag` accepts at most 128 tags, each at most 256 characters. Longer tags are dropped. Use one tag per call. Do not put an email, an access token, or a raw session id in the tag. The user id is already an argument; repeating it in the tag is what lets you expire that user's entries without knowing every limit.
 
-The public catalog and the legal/SEO bodies are shared across users. Recommendation entries are keyed by the user id argument plus a per-user tag. They are derived lists, not the mutable item.
+The public revalidate route allowlists only the shared tags. A caller cannot pass `derived-${userId}` or an arbitrary string. Per-user tags are expired from the server action.
 
 ## Configuration
 
-`cacheForeverSeconds` is `31536000` (365 days). `stale`, `revalidate`, and `expire` are the same number. Freshness comes from tags, not from the clock. A missed invalidation can stick for a year, so every writer that changes a cached list calls `updateTag` or `revalidateTag`.
+`cacheForeverSeconds` is `31536000` (365 days). `stale`, `revalidate`, and `expire` are the same number. Freshness comes from tags, not from the clock. A missed invalidation can stick for a year, so every writer that changes a cached value calls `revalidateTag` or `updateTag`.
 
 ```ts
 const nextConfig = {
@@ -53,41 +77,38 @@ import { cacheLife, cacheTag } from "next/cache"
 
 const FOREVER = { stale: 31_536_000, revalidate: 31_536_000, expire: 31_536_000 }
 
-export async function cachedPublicCatalog(): Promise<CatalogItem[]> {
-  "use cache"
+export async function cachedPublishedLibrary(): Promise<Page[]> {
+  "use cache: remote"
   cacheLife(FOREVER)
-  cacheTag("platform-audiences")
-  return backendGet(getServiceSubject(), "/api/catalog/public/")
+  cacheTag("published-pages")
+  return loadPublishedPages()
 }
 
-export async function cachedRecommendations(userId: string): Promise<Recommendation[]> {
-  "use cache"
+export async function cachedDerivedList(userId: string, limit: number): Promise<Item[]> {
+  "use cache: remote"
   cacheLife(FOREVER)
-  cacheTag(`recommendations-${userId}`)
-  return backendGet(userId, "/api/recommendations/?limit=8")
+  cacheTag(`derived-${userId}`)
+  return backendGet(userId, `/api/derived/?limit=${limit}`)
 }
 ```
 
-`backendGet` signs a short-lived service JWT inside the cached function. The cache stores the JSON. The token is not an argument, so it is not part of the cache key. See `m2m-jwt-service-auth`.
+`backendGet` signs a short-lived service JWT inside the cached function. The cache stores the JSON. The token is not an argument, so it is not part of the cache key.
 
 ## Identity stays outside the cache
 
-`"use cache"` cannot read `cookies()` or `headers()`. Resolve the user id in the caller, then pass the id in.
+`"use cache"` and `"use cache: remote"` cannot read `cookies()` or `headers()`. Resolve the user id in the caller, then pass the id in.
 
 ```tsx
-export async function CatalogLoader() {
+export async function DerivedLoader() {
   const userId = await getCurrentUserId()
-  const [catalog, recommended] = await Promise.all([
-    cachedPublicCatalog(),
-    cachedRecommendations(userId),
-  ])
-  return <Catalog catalog={catalog} recommended={recommended} />
+  const items = await cachedDerivedList(userId, 8)
+  return <DerivedList items={items} />
 }
 ```
 
 Render that loader under `<Suspense>`. `getCurrentUserId()` touches the session cookie, which is the dynamic hole. The rest of the page can stay in the shell.
 
-A cookie-free Supabase client (`Authorization: Bearer <access token>`) does not call `cookies()`, which is why it can run inside a cache helper without forcing a prerender bailout (`supabase-rls-client-reads`). The token that authorizes it still cannot be a `"use cache"` argument: Next hashes arguments into the cache key, the entry fragments on every refresh, and the token string lands in the key. Obtain the token with `getSession()` in the same request and use the client from a server action. The running-job lookup does that and stays uncached.
+A cookie-free data client (`Authorization: Bearer <access token>`) does not call `cookies()`, which is why it can run inside a cache helper without forcing a prerender bailout (`supabase-rls-client-reads`). The token that authorizes it still cannot be a cache argument: Next hashes arguments into the cache key, the entry fragments on every refresh, and the token string lands in the key. Obtain the token with `getSession()` in the same request and use the client from a server action. The running-job lookup does that and stays uncached.
 
 ## Do not cache a failure or an empty stand-in
 
@@ -107,31 +128,27 @@ async function safe<T>(promise: Promise<T>, fallback: T): Promise<T> {
 }
 ```
 
-The fallback lives in the caller, outside `"use cache"`. Putting `return []` in the `catch` inside the cached function stores the empty list for the `forever` profile.
+The fallback lives in the caller, outside the cache directive. Putting `return []` in the `catch` inside the cached function stores the empty list for the `forever` profile.
 
-For a CMS body, throw on HTTP errors so a blip is not stored. Return null only for an intentional draft, and filter those out. That absence is cached until the tag is invalidated, so publishing a draft includes a revalidate of `seo-content` or `legal-content`. When the CMS key is unset, the cached function may return a catalog stub so CI can prerender. That stub is also cached; the first deploy with a real key needs the tag expired.
-
-`cacheTag` accepts at most 128 tags, each at most 256 characters. Longer tags are dropped. These tags are short and one per call.
+For a CMS body, throw on HTTP errors so a blip is not stored. Return null only for an intentional draft, and filter those out. When the CMS key is unset, the cached function may return a catalog stub so CI can prerender. That stub is also cached; the first deploy with a real key needs the shared tag expired.
 
 ## Invalidation
 
+Official Next.js 16 docs: `updateTag` is server-action only. It expires the tag and the next read waits for fresh data. The action response also re-renders the current route (read-your-own-writes). `revalidateTag` without a second argument is the legacy path and behaves like `updateTag`. Pass a `cacheLife` profile. `"max"` is stale-while-revalidate: the action does not re-render the current route, and the next visit that reads the tag can serve the stale value while a fresh fetch runs. `{ expire: 0 }` forces the next read to miss. A cookie write in the same action still re-renders the current route, even when the tag call was `revalidateTag`.
+
 | Call | Where | Effect |
 | --- | --- | --- |
-| `updateTag(tag)` | Server action | Expires the tag and refreshes the page that is rendering. Read-your-own-writes. |
-| `revalidateTag(tag, "max")` | Server action | Expires for the next visit. Does not re-render the current page. |
+| `updateTag(tag)` | Server action | Expires the tag and refreshes the route that called it. |
+| `revalidateTag(tag, "max")` | Server action | Marks the tag stale. Does not re-render the current route (P37). |
 | `revalidateTag(tag, { expire: 0 })` | Route handler | Immediate expiry for a webhook-style caller. |
 
-Official Next.js 16 docs: `updateTag` is for server actions. `revalidateTag` without a second argument is deprecated. `"max"` is the stale-while-revalidate profile. `{ expire: 0 }` forces the next read to miss.
-
-Use `updateTag` after a write when the user stays on a page that shows the new list. Use `revalidateTag(..., "max")` from the action that deletes the page currently on screen. `updateTag` would refresh that page and 404.
-
-Per-user tags are `audience-recommendations-<userId>` and `recommendations-<userId>`. Expire both when the vectors behind them change. The public HTTP route cannot expire them.
+**P37.** Use `revalidateTag(tag, "max")` from a write whose screen does not render the cached lists, and from a delete of the page currently on screen. `updateTag` would re-render that page: a deleted item is requested again and 404s, and a save re-renders a layout that does not show the cached lists. Keep `updateTag` for a screen that must show its own write before the response returns. The reference mutations that touch a derived-list tag all use `revalidateTag(..., "max")`. None call `updateTag`.
 
 ```ts
 import { timingSafeEqual } from "crypto"
 import { revalidateTag } from "next/cache"
 
-const ALLOWED = new Set(["platform-audiences", "seo-content", "legal-content"])
+const ALLOWED = new Set(["published-pages"])
 
 function secretsEqual(provided: string, expected: string): boolean {
   const providedBuf = Buffer.from(provided)
@@ -153,12 +170,12 @@ export async function POST(request: Request) {
     return Response.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  let tag = "platform-audiences"
+  let tag = "published-pages"
   try {
     const body = (await request.json()) as { tag?: unknown }
     if (typeof body?.tag === "string" && body.tag.length > 0) tag = body.tag
   } catch {
-    // Empty or non-JSON body uses the default public tag.
+    // Empty or non-JSON body uses the default shared tag.
   }
   if (!ALLOWED.has(tag)) return Response.json({ error: "Tag not allowed" }, { status: 400 })
 
@@ -167,7 +184,7 @@ export async function POST(request: Request) {
 }
 ```
 
-`REVALIDATE_SECRET` unset is 503, not an open endpoint. The compare is constant-time, including the length mismatch. The allowlist is the three public tags. A caller cannot pass `recommendations-<userId>` or an arbitrary string.
+`REVALIDATE_SECRET` unset is 503, not an open endpoint. The compare is constant-time, including the length mismatch. The allowlist is the shared tags only.
 
 ## Suspense holes
 
@@ -177,13 +194,13 @@ Anything that reads the incoming request has to sit under `<Suspense>` so the pa
 
 ```tsx
 function SidebarLive() {
-  const audienceId = useSearchParams().get("audience")
-  return <Sidebar audienceId={audienceId} />
+  const itemId = useSearchParams().get("item")
+  return <Sidebar itemId={itemId} />
 }
 
 export function SidebarFrame() {
   return (
-    <Suspense fallback={<Sidebar audienceId={null} />}>
+    <Suspense fallback={<Sidebar itemId={null} />}>
       <SidebarLive />
     </Suspense>
   )
@@ -217,40 +234,42 @@ The list loader passes `key={crypto.randomUUID()}` on every server render. A new
 
 Do not also keep a `sessionStorage` snapshot that returns early when the filter key matches. That snapshot survived a create and showed the previous page. If any client snapshot exists, clear it on create, update, and delete before navigating back.
 
-A client section that must stay mounted syncs from props in an effect when the id key changes. `updateTag` refreshes the server props; it does not reset `useState` by itself.
+A client section that must stay mounted syncs from props in an effect when the id key changes. `updateTag` refreshes the server props; it does not reset `useState` by itself. `revalidateTag(..., "max")` does not refresh those props on the current route at all (P37).
 
 ## Failure prevention
 
 - **P01.** `useSearchParams()` and awaited `searchParams` live in a child under `<Suspense>`.
-- **P18.** Item detail, the item list, notes, and message pages are ordinary fetches. Cached recommendation tags are invalidated when the underlying vectors change. The Realtime path refetches; it does not read a cached detail entry.
+- **P18.** Item detail, the item list, notes, and message pages are ordinary fetches. Derived-list tags are invalidated when the underlying vectors change. The Realtime path refetches; it does not read a cached detail entry.
 - **P19.** No `sessionStorage` list that skips refetch. Fresh server renders get a new client `key`. Delete refetches.
 - **P20.** `unstable_rethrow` before a fallback. `connection()` sits outside `try/catch`. No `export const dynamic`.
-- Empty results inside `"use cache"` are stored for a year. Throw on upstream HTTP errors. Isolate fallbacks in the caller.
+- **P37.** A write that must not re-render the current route calls `revalidateTag(tag, "max")`. `updateTag` is only for a screen that displays its own write. Deleting the page on screen with `updateTag` refetches that page and 404s.
+- **P39.** Shared entries use `"use cache: remote"`, `cacheLife`, and `cacheTag`. Plain `"use cache"` is one process's LRU. Arguments are part of the key, so a limit that changes the payload is an argument, not a literal.
+- Empty results inside the cache directive are stored for a year. Throw on upstream HTTP errors. Isolate fallbacks in the caller.
 - Cache arguments are user ids and limits. Access tokens and service JWTs stay out of the key.
-- `REVALIDATE_SECRET` is required. The route allowlist is only the public tags. Compare with `timingSafeEqual`.
-- A CMS draft that later becomes ready is invisible until `seo-content` or `legal-content` is revalidated.
+- `REVALIDATE_SECRET` is required. The route allowlist is only the shared tags. Compare with `timingSafeEqual`.
+- A CMS draft that later becomes ready is invisible until the shared tag is revalidated.
 
 ## Tests
 
-- A cached public function calls `cacheTag` with the public tag and does not call `cookies()`.
-- A cached per-user function's arguments are the user id and a limit, and the tag contains that id.
+- A shared cached function uses `"use cache: remote"`, calls `cacheTag` with the shared tag, and does not call `cookies()`.
+- A per-user function's arguments are the user id and a limit. The tag contains that id. Two limits are two keys.
 - A non-ok API response rejects, and a second call is not served the empty fallback from the cache.
-- `unstable_rethrow` is invoked for a prerender signal before the fallback returns. Cover the list, detail, and goal loaders.
+- `unstable_rethrow` is invoked for a prerender signal before the fallback returns. Cover the list, detail, and related-record loaders.
 - `GET` stream handler calls `connection()` before the `try`.
-- Revalidate route: 503 with no secret, 401 on a bad bearer, 400 on a tag outside the allowlist, 200 and `revalidateTag(tag, { expire: 0 })` for each allowed tag, default tag on an empty body.
-- Delete uses `revalidateTag(..., "max")` when the current page should not refresh. A write that stays on the page uses `updateTag`.
-- Sidebar, subscription, and insights views that read search params are under `<Suspense>`.
+- Revalidate route: 503 with no secret, 401 on a bad bearer, 400 on a tag outside the allowlist, 200 and `revalidateTag(tag, { expire: 0 })` for each allowed tag, default shared tag on an empty body.
+- A delete or a save whose screen does not show the cached lists uses `revalidateTag(..., "max")`. A write that stays on a page that renders the new value uses `updateTag`.
+- Views that read search params are under `<Suspense>`.
 - A list client with a new `key` shows the new server page. A delete refresh token refetches.
 
 ## Checklist
 
 - [ ] `cacheComponents: true` and a `forever` profile of 31536000 / 31536000 / 31536000.
-- [ ] `"use cache"` only on the public catalog, per-user recommendation lists, and legal/SEO bodies.
-- [ ] User id is resolved outside the cache. The service JWT is signed inside. No access token in the cache key.
+- [ ] Shared published content and derived lists use `"use cache: remote"` (P39). Plain `"use cache"` is not the shared store.
+- [ ] User id and every limit are arguments. The service JWT is signed inside. No access token in the cache key.
 - [ ] Upstream HTTP errors throw inside the cache. `unstable_rethrow` precedes every fallback (P20).
-- [ ] `updateTag` for read-your-own-writes. `revalidateTag(tag, "max")` when the current page was just deleted. `revalidateTag(tag, { expire: 0 })` on the secret route.
-- [ ] Route allowlist is `platform-audiences`, `seo-content`, `legal-content`. Missing secret is 503.
+- [ ] `updateTag` only when the current route must show the write. `revalidateTag(tag, "max")` when it must not (P37). `revalidateTag(tag, { expire: 0 })` on the secret route.
+- [ ] Route allowlist is the shared tags only. Missing secret is 503.
 - [ ] `useSearchParams()` is a Suspense child (P01). `connection()` is outside `try/catch` on request-only routes.
 - [ ] `cookies()` (or `connection()`) runs before `new Date()` in a prerendered loader.
 - [ ] Item list and detail are uncached (P18). The list client does not restore a `sessionStorage` snapshot (P19).
-- [ ] Publishing CMS content revalidates `seo-content` or `legal-content`.
+- [ ] Publishing CMS content revalidates the shared tag.
