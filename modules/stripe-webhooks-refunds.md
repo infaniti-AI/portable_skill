@@ -7,7 +7,7 @@ tags: [billing, webhooks, refunds]
 requires: [stripe-checkout]
 related_skills: [add-stripe-billing]
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Stripe webhooks, sync, and refund cancellation
@@ -153,7 +153,7 @@ Stop at the first hit. Log and skip when none exist. Do not guess from the custo
 5. If `metadata.userId` is empty, require an existing row owned by the subject. Otherwise 400. A brand-new subscription must carry the metadata `stripe-checkout` writes.
 6. Upsert with `fallback_user_id` set to the subject, so a metadata miss on an owned row still has a user id.
 
-The Checkout return and the billing-page reconcile both call this route. The webhook may write the same state first. The state key makes the second call a no-op.
+The complete Checkout return calls this route when it has a subscription id. Ordinary billing-page loads only read local entitlement; no page-load reconciliation calls it. The webhook may write the same state first. The state key makes a repeated equivalent sync a no-op.
 
 ## HTTP client
 

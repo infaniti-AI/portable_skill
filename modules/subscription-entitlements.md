@@ -7,7 +7,7 @@ tags: [billing, entitlements, quotas]
 requires: [stripe-webhooks-refunds]
 related_skills: [add-stripe-billing]
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Plan entitlement, quotas, and cancel policy
@@ -133,7 +133,7 @@ Restore, when the tier becomes paid: goals with `paused_by_plan` go back to `act
 
 Skip the allowance change when the user id is not a UUID. Log it. The subscription row may still store that id. Goal and profile foreign keys are UUIDs.
 
-Run this after the row write, on the webhook and on the sync route. A user who cancels at period end stays paid until `current_period_end`, so nothing freezes at cancel time. The freeze runs when a later event stores `canceled` or `past_due`, or when the period end is in the past and something recomputes the tier. `get_user_subscription_tier` does not freeze by itself. Call the allowance function from the writers. A period that elapses with no Stripe event leaves the old goals in place until the next sync. The billing-page reconcile (`stripe-checkout`) is what pulls that update when the user next opens billing. Command checks already see the free tier because they compare `current_period_end` to now. They do not wait for the freeze.
+Run this after the row write, on the webhook and on the sync route. A user who cancels at period end stays paid until `current_period_end`, so nothing freezes at cancel time. The freeze runs when a later event stores `canceled` or `past_due`, or when the period end is in the past and something recomputes the tier. `get_user_subscription_tier` does not freeze by itself. Call the allowance function from the writers. A period that elapses with no Stripe event leaves the old goals in place until the next sync. Ordinary billing visits only read local entitlement (`stripe-checkout`); they do not pull missing updates from Stripe or apply the freeze. A later webhook, complete Checkout return, or explicitly invoked authorized sync must perform that write. Command checks already see the free tier because they compare `current_period_end` to now. They do not wait for the freeze.
 
 ## Cancel policy
 

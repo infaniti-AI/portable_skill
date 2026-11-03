@@ -7,12 +7,12 @@ tags: [billing, checkout, subscriptions]
 requires: [supabase-magic-link-auth]
 related_skills: [add-stripe-billing]
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Hosted Stripe Checkout for a subscription
 
-The browser never sees the secret key and never tokenizes a card. A server action looks up the signed-in user (`supabase-magic-link-auth`), finds or creates a Stripe Customer, and creates a Checkout Session in `subscription` mode. The browser navigates to `session.url`. Stripe hosts the payment page. The return URL brings the user back with the session id. A second server action checks that the session belongs to this user and asks the API to write the subscription. The billing page also compares the local row with Stripe on every visit, so a missed webhook does not leave the page stale.
+The browser never sees the secret key and never tokenizes a card. A server action looks up the signed-in user (`supabase-magic-link-auth`), finds or creates a Stripe Customer, and creates a Checkout Session in `subscription` mode. The browser navigates to `session.url`. Stripe hosts the payment page. The return URL brings the user back with the session id. A second server action checks that the session belongs to this user and asks the API to write the subscription. Ordinary billing visits read the entitled local row; they do not reconcile it with Stripe. A missed webhook can therefore leave local state stale until a later event or explicit sync.
 
 Webhook signature checks, refunds, and the period-field shape are `stripe-webhooks-refunds`. Whether the row grants access is `subscription-entitlements`. This module is the Customer, the session, the return, and the portal.
 
@@ -112,7 +112,7 @@ Price ids come from public env: monthly vs yearly. An empty price id or an empty
 
 If `session.url` is missing, return an error. Do not redirect to an empty string.
 
-## Return and reconcile
+## Checkout return and local billing read
 
 `completeCheckoutSession` runs when the billing page is opened with `session_id`.
 
@@ -123,18 +123,11 @@ If `session.url` is missing, return an error. Do not redirect to an empty string
 5. When `status` is `complete` and the id is present, `POST /api/subscription-sync/` with `{ stripe_subscription_id }` and the user JWT (`m2m-jwt-service-auth`). A sync failure is reported and does not change the returned session status.
 6. Return `complete`, `open`, `expired`, or `not_found`. A thrown retrieve becomes `not_found`.
 
-`loadBillingSubscription` uses that path when a session id is present. If the status is `complete` and the entitled row is already readable, return it. Every other visit, including a complete session whose row is not visible yet, calls reconcile.
+`loadBillingSubscription` returns `{ subscription, checkoutCompleted }`. With a session id it checks the Checkout return above. A complete session sets `checkoutCompleted: true` and reads the entitled local row, once more if the first read is empty. Without completion it reads locally and returns false. A caught error is reported, followed by a local read with false. There is no Stripe subscription-list reconciliation or period-difference comparison on this path.
 
-Reconcile:
+**P51:** `checkoutCompleted` describes the returned session status, not a successful sync or entitlement. The UI separately requires an entitled row before recording a conversion. Its session-storage marker is written before the consented capture call, so blocked analytics can still consume the marker. Use webhook/payment records for authoritative billing facts; client capture is best-effort usage measurement (`posthog-consent-analytics`).
 
-1. Load the latest local row for the user, any status.
-2. Customer id is that row's customer, else the search above. No customer: return the local row only when it is entitled.
-3. List up to 10 subscriptions, `status: "all"`.
-4. Pick the first `active` or `trialing`. Else the one whose id matches the local row. Else the first element. None: if the local row is entitled, sync that id (a missing Stripe subscription is canceled by the API) and re-read the entitled row.
-5. Map the remote subscription with the item-period mapper below. If there is no local row, or status, price, cancel flag, or period differs, sync the remote id and re-read.
-6. Periods match when the unix seconds differ by at most 2. That covers timestamp rounding, not a different period.
-
-On any thrown error, report it and fall back to the entitled local read. The page still renders.
+The pure item-period mapper remains available and unit-tested but currently has no production caller. Keep its schema logic reusable without claiming it repairs a missed webhook. A reconciliation job, if needed, must be an explicit separately tested workflow.
 
 The mapper lives in a module that is not `"use server"` (P17). Next treats value exports from a `"use server"` file as server actions, and a type-only export is erased, so a client that imports it gets `undefined` at runtime.
 
@@ -160,7 +153,7 @@ export function toSubscriptionPayload(subscription: Stripe.Subscription, now = D
 }
 ```
 
-Read the period from the subscription item. On basil it is not on the Subscription. A missing period falls back to now so the payload is complete. That fallback does not grant access: the end is not in the future. The API re-reads Stripe on sync and applies its own mapping (`stripe-webhooks-refunds`). This mapper only decides whether the local row already matches.
+Read the period from the subscription item. On basil it is not on the Subscription. A missing period falls back to now so the payload is complete. That fallback does not grant access: the end is not in the future. The API re-reads Stripe on sync and applies its own mapping (`stripe-webhooks-refunds`). The sync route ignores client status/period fields and retrieves Stripe itself. The retained mapper is not called by the current billing loader.
 
 ## Billing portal
 
@@ -172,7 +165,7 @@ The browser reads its own rows through Supabase. RLS is `SELECT` for `authentica
 
 `app_subscriptions`: `id` uuid, `user_id` text, `stripe_customer_id` text, `stripe_subscription_id` text unique, `status`, `price_id`, `quantity`, `cancel_at_period_end`, `canceled_at` nullable, `current_period_start`, `current_period_end`, `created_at`, `updated_at`. Index `user_id`, `status`, `stripe_customer_id`, `current_period_end`.
 
-The entitled read is `user_id` equal, `status` in `active` and `trialing`, `current_period_end` greater than now, newest `created_at`, limit 1. The reconcile read is the newest row of any status.
+The entitled read is `user_id` equal, `status` in `active` and `trialing`, `current_period_end` greater than now, newest `created_at`, limit 1. The customer lookup may inspect the newest row with a customer id regardless of status; ordinary billing display still uses the entitled predicate.
 
 ## Environment
 
@@ -208,12 +201,12 @@ The webhook secret belongs to `stripe-webhooks-refunds`. Do not put it in a `NEX
 - Put mappers and shared types in a normal module. Import them with `import type` from client components (P17).
 - Read periods from `items.data[0]`. Do not read `subscription.current_period_end`.
 - Set `NEXT_PUBLIC_SITE_URL` per environment so the return does not leave the environment that created the session.
-- Compare periods with a 2-second tolerance before skipping sync. An exact equality check re-syncs on rounding. A multi-minute tolerance hides a real period change.
+- **P51.** Keep Checkout completion, successful sync, local entitlement and analytics delivery separate. Ordinary visits do not recover missed webhooks; add explicit reconciliation if that guarantee is required.
 - Do not log the secret key, the session URL query, or the raw Stripe error body if it echoes a card. The action returns `error.message` to the signed-in user. That is a Stripe message, not a stack trace.
 
 ## Tests
 
-Use a test key and a stub, not live objects. Assert the create params: both metadata copies, `client_reference_id`, `managed_payments.enabled`, and exactly one of `discounts` or `allow_promotion_codes`. Monthly with zero rows and an active promo sets `discounts`. Monthly with a canceled row, yearly, and a missing promo set `allow_promotion_codes`. An entitled local row and a remote `active` subscription each return an error and do not create a session. A retrieved session owned by someone else returns `not_found` and does not POST. `toSubscriptionPayload` reads the item period and, when the item period is absent, uses the injected `now`. A client component test imports the mapper from the non-server module and expects a function, not `undefined`.
+Use a test key and a stub, not live objects. Assert the create params: both metadata copies, `client_reference_id`, `managed_payments.enabled`, and exactly one of `discounts` or `allow_promotion_codes`. Monthly with zero rows and an active promo sets `discounts`. Monthly with a canceled row, yearly, and a missing promo set `allow_promotion_codes`. An entitled local row and a remote `active` subscription each return an error and do not create a session. A retrieved session owned by someone else returns `not_found` and does not POST. `toSubscriptionPayload` reads the item period and, when the item period is absent, uses the injected `now`. A client component test imports the mapper from the non-server module and expects a function, not `undefined`. Stub the billing loader dependencies: no session id performs only a local read; complete return with an empty first read tries locally twice and keeps `checkoutCompleted: true`; non-complete/error paths return false. A sync failure must not be mistaken for granted entitlement, and ordinary visits must not be asserted to call a removed reconciliation path.
 
 ## Checklist
 
@@ -223,7 +216,8 @@ Use a test key and a stub, not live objects. Assert the create params: both meta
 - [ ] `userId` set on the session, the subscription, and `client_reference_id`.
 - [ ] Intro code only for monthly users with zero subscription rows, and never combined with `allow_promotion_codes`.
 - [ ] Existing `active` or `trialing` subscription opens the portal instead of a new session.
-- [ ] Return handler ignores a session id that belongs to another user.
+- [ ] Return handler ignores a session id that belongs to another user. Completion alone grants neither entitlement nor confirmed analytics delivery.
+- [ ] Billing loader returns row plus completion flag; missed-webhook recovery is explicitly designed rather than assumed on page load.
 - [ ] Period mapper uses the subscription item and lives outside `"use server"`.
 - [ ] `NEXT_PUBLIC_SITE_URL` matches the environment.
 - [ ] Browser policy is SELECT-own-rows. The API writes the row.

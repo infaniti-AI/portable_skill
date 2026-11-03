@@ -7,7 +7,7 @@ tags: [llm, comments, workers, embeddings]
 requires: [dramatiq-redis-workers]
 related_skills: [background-jobs]
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Delayed companion comments from one completion
@@ -113,7 +113,7 @@ The save handler's quota gate decides whether this actor is enqueued. A create t
 
 Do not hardcode two sample sizes or a signup-duration rule here. The product that calls the ranker owns those numbers. `BETA_TESTING`, when true, makes tier resolution return the larger-cap tier for every user. Default is false.
 
-Recent rows are `datetime >= item_time - window`, newest first, then sliced to the caller-supplied recent cap. The current item is removed. Similar rows use cosine similarity `1 - distance >= 0.6`, the caller-supplied similar cap, and no date predicate (`days` left unset). Exclude the recent ids and the current id. On this query, a set `days` means "strictly older than N days", which is the wrong window for comments. Leave it unset.
+Recent rows are `datetime >= item_time - window`, newest first, then sliced to the caller-supplied recent cap. The current item is removed. Similar rows use `1 - distance >= threshold`, the caller-supplied similar cap, and no date predicate (`days` left unset). The actor omits the threshold argument and currently inherits the repository RAG default of `0.5`; this is a task policy to recalibrate per embedding profile, not a universal cutoff (`pgvector-similarity-search`, P46). Exclude the recent ids and the current id. On this query, a set `days` means "strictly older than N days", which is the wrong window for comments. Leave it unset.
 
 `reference_now` for those cutoffs is the item's stored timestamp. Reject a null timestamp before computing cutoffs. Do not substitute the server clock.
 

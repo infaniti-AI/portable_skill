@@ -48,7 +48,7 @@ sequenceDiagram
 | `NEXT_PUBLIC_SUPABASE_URL` | Required | Browser client. Same project as `SUPABASE_URL`. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Required | Browser client. The anon key is not a user session. |
 | `NEXT_PUBLIC_COMMENT_LIVE_SECONDS` | `300` | How long after the parent was created the socket stays open. |
-| `NEXT_PUBLIC_COMMENT_CATCHUP_HOURS` | `12` | After this, focus stops refetching. The socket is already closed. |
+| `NEXT_PUBLIC_COMMENT_CATCHUP_HOURS` | `12` | Deadline measured from parent creation. A successful catch-up at or after it removes that parent from the watch map. |
 
 Non-finite or non-positive values fall back to those defaults. Both names are public because the browser enforces the windows. They are durations, not secrets.
 
@@ -221,7 +221,7 @@ const channel = supabase
     (payload) => {
       const row = payload.new && typeof payload.new === "object" ? payload.new : {}
       const parentId = "item_id" in row && row.item_id != null ? String(row.item_id) : null
-      void refreshUnread()
+      void mergeParentUnread(itemId)
       listeners.forEach((listener) => listener({ item_id: parentId }))
     },
   )
@@ -235,35 +235,33 @@ const channel = supabase
 
 The random suffix avoids reusing a name that is still leaving. A second parent gets its own channel. Starting the same parent twice does not open a second channel. Forget bumps the attempt, deletes the parent from the map, and calls `removeChannel` on that channel only.
 
-The timer calls the same close when the live window elapses. Unmount clears every timer and removes every channel.
+The timer expires that parent: invalidate pending opens, remove it from the live map, close its channel and remember it in the catch-up map. Unmount clears every timer and removes every channel. The reference computes the timer duration before awaiting token/setup, so slow setup can extend the effective window; recompute the remaining duration before subscribing when a strict deadline matters.
 
 `CHANNEL_ERROR` and `TIMED_OUT` are reported. The next focus, `online`, or visibility recovery calls the opener again, and a channel in `closed`, `errored`, or `leaving` is replaced.
 
 ## Focus and catch-up
 
-While the newest parent's channel is joined and `now` is still inside the live window, focus does not refetch. Outside that window, focus refetches until one catch-up has landed at or after `newestCreatedAt + catchupMs`. No newest parent means there is nothing to catch.
+Track each parent independently rather than letting one newest row decide recovery for every row. Keep creation timestamps in two maps, separate from the open-channel map:
 
 ```ts
-export function shouldFetchUnread(input: {
-  now: number
-  newestCreatedAtMs: number | null
-  unreadCaughtUpAtMs: number | null
-  newestChannelJoined: boolean
-  liveMs: number
-  catchupMs: number
-}): boolean {
-  const { now, newestCreatedAtMs, unreadCaughtUpAtMs, newestChannelJoined, liveMs, catchupMs } =
-    input
-  if (newestCreatedAtMs == null) return false
-  if (unreadCaughtUpAtMs != null && unreadCaughtUpAtMs >= newestCreatedAtMs + catchupMs) {
-    return false
-  }
-  if (now < newestCreatedAtMs + liveMs && newestChannelJoined) return false
-  return true
+type WatchSeed = {
+  live: Array<{ id: string; created_at: string }>
+  catchup: Array<{ id: string; created_at: string }>
 }
+
+const live = new Map<string, number>()
+const catchup = new Map<string, number>()
 ```
 
-Seed the watch list from parents that are still inside the live window. A parent older than the window is remembered for catch-up and does not get a channel. A parent the user just saved uses `Date.now()` as its created time and opens immediately.
+Seed the unread list once, then merge valid watch timestamps. A live parent opens its own channel; a catch-up parent has no socket. A just-saved parent uses `Date.now()` and moves to live without closing other parents. Forget removes that id from both maps, invalidates pending opens and closes only its channel.
+
+On focus, `online`, or becoming visible, the reference first requests catch-up ids, then checks live parents. Expired live parents move to catch-up; remaining live parents reopen only missing/failed channels. A parent moved during that second step is fetched on a later recovery, because the catch-up request already took its id snapshot. Recovery does not poll healthy live parents for unread rows.
+
+Catch-up uses one in-flight guard and `getUnreadItems(ids)`, then merges incoming rows by their stable child ids rather than replacing the entire unread list. Only after success does it remove watch entries whose creation time plus catch-up duration has passed. A failed request leaves entries for the next recovery; a parent already past its deadline still gets one successful final fetch. There is no background polling timer for catch-up.
+
+The reference prunes the current catch-up map after success, not just the requested snapshot. A parent added while that request is pending can therefore be removed if its deadline has passed without being part of that fetch. An adaptation should prune only fetched ids with the same recorded timestamp, and test late-added/forgotten parents and responses arriving after deletion or mark-read. These race protections are recommendations, not existing guarantees.
+
+INSERT recovery is targeted too: `mergeParentUnread(itemId)` fetches only the subscribed parent's unread rows and merges them, while notifying detail listeners with the payload parent id. The separate full refresh replaces the list. Do not confuse a targeted merge with a complete server snapshot.
 
 ## Payload is a signal
 
@@ -295,13 +293,15 @@ On disposable databases, test publication setup separately from browser mocks:
 Mock the server action and a channel object that records `setAuth`, the filter, and `removeChannel`.
 
 - `setAuth` receives the server token before the INSERT handler is registered.
-- An INSERT calls the unread refetch and the listener. The unread count follows the API response, not the payload body.
+- An INSERT fetches only that parent's unread rows and calls the listener. Merging preserves other parents; note bodies come from the API, not the payload.
 - A second parent leaves the first channel open, with filter `item_id=eq.<second>`.
 - A second start for the same parent does not create another channel.
 - A parent older than the live window never opens a channel.
 - Forget closes only that parent's channel.
-- Focus while the newest channel is joined does not refetch.
-- Focus after the live window does refetch, until catch-up passes the deadline.
+- A healthy live parent is not polled on focus; a different catch-up parent is still fetched.
+- Focus after live expiry moves that parent to catch-up; the next recovery includes it. A failed catch-up retains the watch entry; success at or after its deadline removes it.
+- Targeted INSERT/catch-up responses merge by child id and preserve other parents. A full refresh replaces the list.
+- Test overlapping focus/online events with one catch-up in flight, and late-added/forgotten ids. Snapshot-scoped pruning is an adaptation acceptance case, not an implemented guarantee.
 - A channel opened with a few milliseconds of life closes itself.
 - `CHANNEL_ERROR` is reported with the status and parent id.
 - A null token skips subscribe.
@@ -320,6 +320,6 @@ Mock the server action and a channel object that records `setAuth`, the filter, 
 - [ ] One channel per parent. Forget and the live-window timer remove that channel only.
 - [ ] INSERT refetches the API list. Detail is uncached (P18).
 - [ ] Live window is shorter than `jwt_expiry` (3600 in local Auth config) unless a joined channel refreshes `setAuth`.
-- [ ] Focus uses `shouldFetchUnread`. Catch-up stops at `newestCreatedAt + catchup`.
+- [ ] Recovery uses per-parent live/catch-up maps and targeted merge; deadlines are pruned only after successful catch-up. Late-add/forget races are reviewed.
 - [ ] CSP `connect-src` includes the project `wss:` origin.
 - [ ] Tests cover token, filter, second parent, expired window, forget, focus, timer, and `CHANNEL_ERROR`.
