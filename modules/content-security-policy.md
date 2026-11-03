@@ -7,16 +7,16 @@ tags: [security, csp, headers]
 requires: [nextjs-cache-components]
 related_skills: [bootstrap-next-supabase]
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Content Security Policy alongside cache components
 
-`headers()` in `next.config.ts` returns one policy for every path. The value is computed when the server process starts, from environment origins. It cannot see a per-request nonce.
+`headers()` in `next.config.ts` returns path rules with environment-derived values, using the [Next.js response-header configuration](https://nextjs.org/docs/app/api-reference/config/next-config-js/headers). These rules cannot see a per-request nonce. Production builds serialize custom routes into the routes manifest; configure the environment before building and rebuild/redeploy when it changes.
 
 **P21.** Cache components prerender one HTML shell and reuse it. A nonce in that shell would have to match a CSP header that changes every request. Those two constraints disagree, so `script-src` keeps `'unsafe-inline'` and there is no nonce. `style-src` also allows `'unsafe-inline'` because the UI uses inline styles. That exception is separate from the nonce problem. Do not add `'unsafe-eval'`. See `nextjs-cache-components`.
 
-The flag `SECURITY_HEADERS_ENABLED` defaults on. The string `"false"` returns an empty header list for local debugging. Any other value, including unset, sends the headers. Changing the flag means restarting the process, because `next.config.ts` reads it at load.
+The flag `SECURITY_HEADERS_ENABLED` defaults on. Only the string `"false"` omits CSP and its companion security headers for local debugging. Beta indexing policy is independent: beta still sends `X-Robots-Tag: noindex` on `/:path*` with this flag off (P48). The rules are empty only when security headers are off **and** the configured site is not beta. The source classifies the hostname in `NEXT_PUBLIC_SITE_URL`, not the incoming request's Host. See `nextjs-seo-geo` for indexing mechanics and review-host configuration.
 
 ## Headers
 
@@ -28,6 +28,7 @@ The flag `SECURITY_HEADERS_ENABLED` defaults on. The string `"false"` returns an
 | `Referrer-Policy` | `strict-origin-when-cross-origin` |
 | `Permissions-Policy` | `camera=(), geolocation=(), microphone=()` |
 | `Strict-Transport-Security` | `max-age=63072000; includeSubDomains; preload`, and only when `NODE_ENV` is `production` |
+| `X-Robots-Tag` | `noindex` for a configured beta site, independently of the security flag. |
 
 `frame-ancestors 'none'` matches the frame denial. HSTS is omitted outside production so an HTTP dev host is not pinned. `upgrade-insecure-requests` is appended to the policy only in production for the same reason.
 
@@ -136,6 +137,12 @@ Wire it next to `cacheComponents`:
 const securityHeadersEnabled = process.env.SECURITY_HEADERS_ENABLED !== "false"
 const isProd = process.env.NODE_ENV === "production"
 
+// Generic configured-host classifier; adapt the hostname for the deployment.
+function isBetaSite(): boolean {
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://www.example.com"
+  return new URL(siteUrl).hostname === "beta.example.com"
+}
+
 const securityHeaders = [
   { key: "Content-Security-Policy", value: buildContentSecurityPolicy(isProd) },
   { key: "X-Frame-Options", value: "DENY" },
@@ -150,18 +157,24 @@ const securityHeaders = [
 const nextConfig = {
   cacheComponents: true,
   async headers() {
-    if (!securityHeadersEnabled) return []
-    return [{ source: "/:path*", headers: securityHeaders }]
+    const headers = [
+      ...(securityHeadersEnabled ? securityHeaders : []),
+      ...(isBetaSite() ? [{ key: "X-Robots-Tag", value: "noindex" }] : []),
+    ]
+    return headers.length ? [{ source: "/:path*", headers }] : []
   },
 }
 ```
 
 A config wrapper (error reporting, for example) must export this object rather than replace `headers()`.
 
+`X-Robots-Tag` controls indexing for cooperating crawlers; it provides no access control. Crawlers must be allowed to fetch a response to see its noindex rule, as described in [Google's robots-header guidance](https://developers.google.com/search/docs/crawling-indexing/robots-meta-tag). Keep the indexing rules independent when composing header arrays.
+
 ## Failure prevention
 
 - **P21.** Keep `'unsafe-inline'` on `script-src` (the cached shell cannot carry a nonce) and on `style-src` (inline styles). Do not add a nonce or `'unsafe-eval'`. Leave `default-src`, `object-src`, `frame-ancestors`, `frame-src`, and `connect-src` locked to known origins.
-- The header is on unless `SECURITY_HEADERS_ENABLED` is the string `false`.
+- Security headers are on unless `SECURITY_HEADERS_ENABLED` is the string `false`.
+- **P48.** Compose beta `X-Robots-Tag` independently. Do not return early for the security toggle. Configure the site origin before building; aliases are not inferred from request Host.
 - HSTS and `upgrade-insecure-requests` are production-only.
 - Build every env origin with `URL.origin`. A failed parse contributes nothing. A DSN contributes its host, not the key in the userinfo.
 - Omit the media origin when `NEXT_PUBLIC_MEDIA_BASE_URL` is unset.
@@ -176,7 +189,8 @@ A config wrapper (error reporting, for example) must export this object rather t
 Assert against the header value, not a live browser, unless a browser is already in the suite.
 
 - With the flag unset, `/:path*` returns `Content-Security-Policy`, `nosniff`, `DENY`, the referrer policy, and the permissions policy.
-- `SECURITY_HEADERS_ENABLED=false` returns no security headers.
+- With `SECURITY_HEADERS_ENABLED=false`, beta returns only `X-Robots-Tag: noindex`; non-beta returns no rules. With the flag on, beta gets both security headers and noindex, and non-beta gets only security headers.
+- Host parsing matches `http://BETA.example.com:3000` and a trailing slash, while `beta.example.com.other.example`, non-beta hosts and the unset-origin fallback do not match. Reimport the config after changing the security flag because it is captured at module load. The source indexing tests cover host cases; the flag/host matrix also needs explicit coverage.
 - `script-src` and `style-src` contain `'unsafe-inline'` and do not contain a nonce. Neither contains `'unsafe-eval'`.
 - `connect-src` contains the Supabase `https` origin and the matching `wss` origin.
 - A DSN `https://public@ingest.example.com/1` contributes `https://ingest.example.com` and not `public`.
@@ -188,7 +202,8 @@ Assert against the header value, not a live browser, unless a browser is already
 ## Checklist
 
 - [ ] `cacheComponents` stays on. `script-src` and `style-src` use `'unsafe-inline'` with no nonce and no `'unsafe-eval'` (P21).
-- [ ] `SECURITY_HEADERS_ENABLED=false` is the only off switch. Default is on.
+- [ ] `SECURITY_HEADERS_ENABLED=false` disables only security headers. Default is on; beta noindex survives either setting (P48).
+- [ ] Site origin is set before building; exact beta hostname classification and all four flag/host combinations are checked. The config wrapper preserves the combined rules.
 - [ ] HSTS `max-age=63072000; includeSubDomains; preload` and `upgrade-insecure-requests` are production-only.
 - [ ] Origins come from `URL.origin`. DSN userinfo is not in the header. Missing media URL omits the origin.
 - [ ] `connect-src` has Supabase `https` and `wss`, the storage API host, Stripe API, Sentry origin, and PostHog.

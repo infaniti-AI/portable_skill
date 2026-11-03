@@ -7,7 +7,7 @@ tags: [cache, rendering, security]
 requires: []
 related_skills: [bootstrap-next-supabase]
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Next.js 16 cache components and tagged invalidation
@@ -22,7 +22,7 @@ The app on disk is Next.js 16.3. The handler names below match the current Next.
 
 Three kinds of read may use `"use cache: remote"` plus `cacheLife` and `cacheTag`.
 
-- **Shared published content.** Many requests need the same body, and it changes only when an editor publishes. One function, one short tag, no user id. A draft is an intentional miss: return null and filter it out. That absence is stored until the tag is invalidated, so publishing includes a revalidate of the shared tag.
+- **Shared published content.** Many requests need the same body. One function, one short tag, no user id. A draft is an intentional miss: return null and filter it out. That absence is cached too, so publishing includes revalidation of the shared tag. Builds, cache misses and expiry can also load current content; a long lifetime is not a manual-only publication lock.
 - **Derived lists.** The result is expensive, and it changes when an upstream vector or catalog changes, not on every create or delete of the source item. Pass the user id and every limit that changes the payload as arguments. Put the user id in the tag so one user's write does not expire every user.
 - **A public catalog that is identical for every caller.** Fetch it with a service subject inside the cached function. The token is not an argument, so it is not part of the key. See `m2m-jwt-service-auth`.
 
@@ -42,7 +42,7 @@ These reads stay ordinary request fetches. Do not put them in `"use cache"` or `
 
 ## How to choose a tag and a key
 
-Arguments and closed-over values are part of the cache key. Two `limit` values are two entries even when they share a tag. Pass every input that changes the result as an argument. A literal inside the function is not part of the key: editing it does not create a new entry until the tag is invalidated or the profile expires.
+Arguments and captured serializable values are part of the cache key. Two `limit` values are two entries even when they share a tag. Pass every runtime input that changes the result as an argument. The key also includes build/deployment and function identity, so a code change or new build can create a new entry; do not assume cached content survives deployment unchanged. See the [official cache-key rules](https://nextjs.org/docs/app/api-reference/directives/use-cache#cache-keys).
 
 | Invalidation set | Tag shape | Who expires it |
 | --- | --- | --- |
@@ -110,7 +110,7 @@ Render that loader under `<Suspense>`. `getCurrentUserId()` touches the session 
 
 A cookie-free data client (`Authorization: Bearer <access token>`) does not call `cookies()`, which is why it can run inside a cache helper without forcing a prerender bailout (`supabase-rls-client-reads`). The token that authorizes it still cannot be a cache argument: Next hashes arguments into the cache key, the entry fragments on every refresh, and the token string lands in the key. Obtain the token with `getSession()` in the same request and use the client from a server action. The running-job lookup does that and stays uncached.
 
-## Do not cache a failure or an empty stand-in
+## Choose the failure policy at the cache boundary
 
 `backendGet` throws when the response is not ok. A throw is not stored as a successful empty list. Callers that want an isolated section catch after rethrowing Next's prerender signal:
 
@@ -130,16 +130,18 @@ async function safe<T>(promise: Promise<T>, fallback: T): Promise<T> {
 
 The fallback lives in the caller, outside the cache directive. Putting `return []` in the `catch` inside the cached function stores the empty list for the `forever` profile.
 
-For a CMS body, throw on HTTP errors so a blip is not stored. Return null only for an intentional draft, and filter those out. When the CMS key is unset, the cached function may return a catalog stub so CI can prerender. That stub is also cached; the first deploy with a real key needs the shared tag expired.
+Keep generic transport failures observable rather than converting them into cached empty stand-ins. An editorial workflow can deliberately choose a different policy: the reference article collection logs and skips individual unreadable or invalid articles, then successfully caches the remaining subset. Every article failing can therefore replace a populated collection with `[]` (P47). A warm stale entry is not protection against that successful empty replacement. The parsing, publication contract and limits of this choice belong in `notion-cms-publication`.
+
+The article collection rejects a missing `NOTION_API_KEY` in production before per-article isolation; outside production a missing key returns an empty collection. A configured but rejected key can cause every article read to be skipped. CI production builds use a local CMS endpoint (`NOTION_API_BASE_URL`) and synthetic key, exercising the real loader rather than publishing catalog stubs; see `nextjs-testing`. The separate legal loader retains its own version-selection/error policy and returns an empty library without a key. Do not infer that it inherits the article guard or skip behavior.
 
 ## Invalidation
 
-Official Next.js 16 docs: `updateTag` is server-action only. It expires the tag and the next read waits for fresh data. The action response also re-renders the current route (read-your-own-writes). `revalidateTag` without a second argument is the legacy path and behaves like `updateTag`. Pass a `cacheLife` profile. `"max"` is stale-while-revalidate: the action does not re-render the current route, and the next visit that reads the tag can serve the stale value while a fresh fetch runs. `{ expire: 0 }` forces the next read to miss. A cookie write in the same action still re-renders the current route, even when the tag call was `revalidateTag`.
+`updateTag` is server-action only. It expires the tag and the next read waits for fresh data. The action response also re-renders the current route (read-your-own-writes). `revalidateTag` without a second argument is deprecated and immediately expires data; it does not acquire `updateTag`'s action-only contract. `"max"` is stale-while-revalidate: the next visit that reads the tag can serve the stale value while a fresh fetch runs. `{ expire: 0 }` makes that next read block for fresh data. The invalidation call itself does not rebuild the collection. See [official revalidateTag semantics](https://nextjs.org/docs/app/api-reference/functions/revalidateTag). A cookie write in the same action still re-renders the current route, even when the tag call was `revalidateTag`.
 
 | Call | Where | Effect |
 | --- | --- | --- |
 | `updateTag(tag)` | Server action | Expires the tag and refreshes the route that called it. |
-| `revalidateTag(tag, "max")` | Server action | Marks the tag stale. Does not re-render the current route (P37). |
+| `revalidateTag(tag, "max")` | Server action or route handler | Marks the tag stale; subsequent reads can serve stale while rebuilding. Does not itself re-render the current route (P37). |
 | `revalidateTag(tag, { expire: 0 })` | Route handler | Immediate expiry for a webhook-style caller. |
 
 **P37.** Use `revalidateTag(tag, "max")` from a write whose screen does not render the cached lists, and from a delete of the page currently on screen. `updateTag` would re-render that page: a deleted item is requested again and 404s, and a save re-renders a layout that does not show the cached lists. Keep `updateTag` for a screen that must show its own write before the response returns. The reference mutations that touch a derived-list tag all use `revalidateTag(..., "max")`. None call `updateTag`.
@@ -148,7 +150,7 @@ Official Next.js 16 docs: `updateTag` is server-action only. It expires the tag 
 import { timingSafeEqual } from "crypto"
 import { revalidateTag } from "next/cache"
 
-const ALLOWED = new Set(["published-pages"])
+const ALLOWED = new Set(["published-pages", "policy-library"])
 
 function secretsEqual(provided: string, expected: string): boolean {
   const providedBuf = Buffer.from(provided)
@@ -179,12 +181,12 @@ export async function POST(request: Request) {
   }
   if (!ALLOWED.has(tag)) return Response.json({ error: "Tag not allowed" }, { status: 400 })
 
-  revalidateTag(tag, { expire: 0 })
+  revalidateTag(tag, tag === "published-pages" ? "max" : { expire: 0 })
   return Response.json({ revalidated: true, tag })
 }
 ```
 
-`REVALIDATE_SECRET` unset is 503, not an open endpoint. The compare is constant-time, including the length mismatch. The allowlist is the shared tags only.
+`REVALIDATE_SECRET` unset is 503, not an open endpoint. Equal-length buffers use `timingSafeEqual`; the mismatch branch rejects after a dummy comparison, without claiming constant-time execution of the whole handler. The allowlist is the shared tags only. Article refresh selects `"max"`; the separate legal library selects `{ expire: 0 }`. A 200 acknowledges invalidation, not completed publication or guaranteed fresh content on the next article response.
 
 ## Suspense holes
 
@@ -244,10 +246,11 @@ A client section that must stay mounted syncs from props in an effect when the i
 - **P20.** `unstable_rethrow` before a fallback. `connection()` sits outside `try/catch`. No `export const dynamic`.
 - **P37.** A write that must not re-render the current route calls `revalidateTag(tag, "max")`. `updateTag` is only for a screen that displays its own write. Deleting the page on screen with `updateTag` refetches that page and 404s.
 - **P39.** Shared entries use `"use cache: remote"`, `cacheLife`, and `cacheTag`. Plain `"use cache"` is one process's LRU. Arguments are part of the key, so a limit that changes the payload is an argument, not a literal.
-- Empty results inside the cache directive are stored for a year. Throw on upstream HTTP errors. Isolate fallbacks in the caller.
+- Successful empty results receive the configured long lifetime. Generic transport errors throw; caller fallbacks remain outside the cache. Article publication explicitly skips per-article failures and can cache partial or empty results (P47).
+- Missing production article credentials throw; offline production builds need the CMS mock and synthetic key. Legal loading has a separate policy.
 - Cache arguments are user ids and limits. Access tokens and service JWTs stay out of the key.
 - `REVALIDATE_SECRET` is required. The route allowlist is only the shared tags. Compare with `timingSafeEqual`.
-- A CMS draft that later becomes ready is invisible until the shared tag is revalidated.
+- Revalidate after editorial changes; builds, cache misses and expiry can also execute the CMS loader.
 
 ## Tests
 
@@ -256,7 +259,8 @@ A client section that must stay mounted syncs from props in an effect when the i
 - A non-ok API response rejects, and a second call is not served the empty fallback from the cache.
 - `unstable_rethrow` is invoked for a prerender signal before the fallback returns. Cover the list, detail, and related-record loaders.
 - `GET` stream handler calls `connection()` before the `try`.
-- Revalidate route: 503 with no secret, 401 on a bad bearer, 400 on a tag outside the allowlist, 200 and `revalidateTag(tag, { expire: 0 })` for each allowed tag, default shared tag on an empty body.
+- Revalidate route: 503 with no secret, 401 on a bad bearer, 400 on a tag outside the allowlist; article tag uses `"max"`, legal tag uses `{ expire: 0 }`. Empty/non-JSON body selects the default shared tag. A 200 does not assert a rebuilt collection.
+- Publication boundary: missing production key throws before loading; configured key with mixed/all-failed article reads yields partial/empty success. A cold production CI build reads the mock without bypassing the guard.
 - A delete or a save whose screen does not show the cached lists uses `revalidateTag(..., "max")`. A write that stays on a page that renders the new value uses `updateTag`.
 - Views that read search params are under `<Suspense>`.
 - A list client with a new `key` shows the new server page. A delete refresh token refetches.
@@ -266,10 +270,10 @@ A client section that must stay mounted syncs from props in an effect when the i
 - [ ] `cacheComponents: true` and a `forever` profile of 31536000 / 31536000 / 31536000.
 - [ ] Shared published content and derived lists use `"use cache: remote"` (P39). Plain `"use cache"` is not the shared store.
 - [ ] User id and every limit are arguments. The service JWT is signed inside. No access token in the cache key.
-- [ ] Upstream HTTP errors throw inside the cache. `unstable_rethrow` precedes every fallback (P20).
-- [ ] `updateTag` only when the current route must show the write. `revalidateTag(tag, "max")` when it must not (P37). `revalidateTag(tag, { expire: 0 })` on the secret route.
+- [ ] Generic transport errors throw; publication's deliberate per-article skip and possible empty replacement are understood (P47). `unstable_rethrow` precedes caller fallbacks (P20).
+- [ ] `updateTag` only when the current route must show the write (P37). Secret route selects `"max"` for published articles and `{ expire: 0 }` for the legal library.
 - [ ] Route allowlist is the shared tags only. Missing secret is 503.
 - [ ] `useSearchParams()` is a Suspense child (P01). `connection()` is outside `try/catch` on request-only routes.
 - [ ] `cookies()` (or `connection()`) runs before `new Date()` in a prerendered loader.
 - [ ] Item list and detail are uncached (P18). The list client does not restore a `sessionStorage` snapshot (P19).
-- [ ] Publishing CMS content revalidates the shared tag.
+- [ ] Publishing CMS content revalidates the shared tag; deploy/cache misses can load CMS too. Production CI uses a CMS mock and synthetic key.
