@@ -7,7 +7,7 @@ tags: [performance, containers, scaling]
 requires: [azure-container-apps-and-cicd]
 related_skills: []
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Container Apps CPU, scale rules, and probes
@@ -35,12 +35,14 @@ Azure's scale defaults, when the fields are omitted, are minimum 0 and maximum 1
 The container command replaces the image `CMD`. Both are one Uvicorn process:
 
 ```text
-uvicorn app.asgi:application --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 30
+uvicorn app.asgi:application --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 --timeout-graceful-shutdown 30
 ```
 
 There is no `--workers` flag. A second Uvicorn worker would be another process on the same 1 vCPU and the same `2Gi`. The image comment leaves Gunicorn out at this size: it is a process manager, and one process is the replica.
 
 `--timeout-graceful-shutdown 30` is the process budget. The app template sets `termination_grace_period_seconds` to 35. The platform wait stays longer than the process timeout so in-flight requests finish before the container is killed.
+
+`--timeout-keep-alive 120` controls idle HTTP connections between requests, independently of shutdown grace. The per-hop timer checks and bounded GET retry policy are in `http-keepalive-econnreset` (P45).
 
 Ingress is internal, port 8000, transport `http`. Internal ingress still has an HTTP concurrency count. The scale rule replaces Azure's implicit rule.
 
@@ -114,7 +116,7 @@ Django returns 400 when that host is missing from `ALLOWED_HOSTS`. Production al
 2. Set minimum and maximum replicas. API minimum 1. Worker minimum 2. Tunnel minimum equals maximum.
 3. Set one HTTP rule on the API at 50 concurrent requests. Leave the worker's HTTP rule list empty.
 4. Point the worker rule at `host:port`, list `dramatiq:default`, length `8`, TLS on, password from the vault secret `redis-password`.
-5. Run one Uvicorn process and one Dramatiq process with 8 threads. Keep the platform grace (35) above the Uvicorn grace (30).
+5. Run one Uvicorn process with `--timeout-keep-alive 120` in both the image CMD and API override, and one Dramatiq process with 8 threads. Keep the platform grace (35) above the Uvicorn shutdown grace (30).
 6. Turn probes on only for the API. Path `/health/`, header `Host: localhost`. Allow that host.
 
 ## Failure prevention
@@ -132,7 +134,7 @@ Django returns 400 when that host is missing from `ALLOWED_HOSTS`. Production al
 
 ## Tests
 
-`terraform plan` for the API shows 1 vCPU, `2Gi`, replicas 1–3, one HTTP rule with `concurrent_requests` 50, command ending in `--timeout-graceful-shutdown` `30`, and three HTTP probes on `/health/` with header `Host` `localhost`. Startup failure threshold is 24. Readiness success threshold is 1.
+`terraform plan` for the API shows 1 vCPU, `2Gi`, replicas 1–3, one HTTP rule with `concurrent_requests` 50, command containing `--timeout-keep-alive` `120` and ending in `--timeout-graceful-shutdown` `30`, and three HTTP probes on `/health/` with header `Host` `localhost`. Check that the image CMD also sets keepalive 120. Startup failure threshold is 24. Readiness success threshold is 1.
 
 The worker plan shows 1 vCPU, `2Gi`, replicas 2–4, command `--processes` `1` `--threads` `8`, no ingress, no probes, and one `redis` rule whose metadata `listLength` is `8`, `listName` is `dramatiq:default`, and `enableTLS` is `true`. The password authentication secret is `redis-password`. The address is not a URL and does not contain the password.
 
@@ -144,7 +146,7 @@ A settings test boots production with `localhost` in `ALLOWED_HOSTS` and raises 
 
 - [ ] API and worker are 1 vCPU and `2Gi`. The tunnel is 0.25 vCPU and `0.5Gi`. Both pairs are on the Consumption list.
 - [ ] API replicas are 1–3 with HTTP concurrency 50. Worker replicas are 2–4 on Redis list length 8. Tunnel replicas are 2 and 2.
-- [ ] Uvicorn is one process, graceful shutdown 30. Platform termination grace is 35.
+- [ ] Uvicorn is one process, keepalive 120 in the image CMD and API override, graceful shutdown 30. Platform termination grace is 35.
 - [ ] Dramatiq is `--processes 1 --threads 8`. The worker command is set.
 - [ ] The Redis rule uses `host:port`, TLS, and a vault password. The password is not in the address.
 - [ ] API probes are `/health/` with `Host: localhost`. The worker has probes off.
