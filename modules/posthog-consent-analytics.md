@@ -1,20 +1,20 @@
 ---
 name: posthog-consent-analytics
 title: PostHog after a cookie consent choice
-summary: Load the PostHog snippet only after the visitor accepts analytics, with person profiles and session replay left off. Use this when product analytics must wait for consent and the page shell is cached.
+summary: Gate the PostHog snippet, identity, and custom events on analytics consent; queue consented calls until initialization and reset identity on logout. Use this when a cached Next.js shell needs anonymous public visits and identified signed-in usage with session replay off.
 stack: [nextjs, posthog]
 tags: [analytics, consent, privacy]
 requires: [content-security-policy]
 related_skills: [bootstrap-next-supabase]
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # PostHog after a cookie consent choice
 
 The snippet is a client component. It renders nothing until a stored choice says analytics is allowed and a project key exists. Necessary cookies (the auth session) are not gated here. There is no server-side consent record. The choice lives in `localStorage` and survives a full load between the public root layout and the signed-in root layout, which are separate documents.
 
-No call site identifies a user. No code reads `utm_` query parameters. Page views are the snippet's own `capture_pageview`. Do not add a campaign parser.
+A client wrapper handles `identify`, custom `capture`, and logout `reset`. It checks consent before accepting calls and SDK readiness before sending them. A session component supplies the stable auth subject after mount. Automatic page views remain enabled; there is no application `utm_` parser.
 
 ## Consent record
 
@@ -103,21 +103,22 @@ function initSnippet(projectKey: string, host: string) {
       capture_pageview: true,
       capture_pageleave: true,
       disable_session_recording: true,
+      loaded: () => window.dispatchEvent(new Event("app-analytics-ready")),
     })
   }
   start()
 }
 ```
 
-`person_profiles: "identified_only"` creates a person profile only after an `identify` call. The app never calls `identify`, so events stay anonymous. Leave it that way unless a later change has a reason to attach a user id, and only after analytics consent.
+`person_profiles: "identified_only"` allows anonymous public events and identified events after a person profile is created. The signed-in component now calls `identify` after consent and initialization. `identified_only` does not disable identification. See [PostHog event identity](https://posthog.com/docs/data/anonymous-vs-identified-events).
 
-`disable_session_recording: true` matches the banner. Autocapture, page views, and page leaves are on. Those are the only capture paths. There is no separate event list in the app.
+`disable_session_recording: true` keeps replay off. Autocapture, page views, and page leaves remain on alongside custom events. The `loaded` callback announces readiness; the wrapper and the session component must subscribe to the same event name.
 
 Inject the project key and the host with `JSON.stringify` inside the inline script so a quote in the value cannot break out of the string. The key is public (`NEXT_PUBLIC_POSTHOG_KEY`). It is still not a secret to paste into a log line you do not need.
 
-When consent flips to false, unmounting the script tags leaves a `window.posthog` that is already running. Stop the 100 ms retry. If the global exposes an opt-out method, call it.
+When consent flips to false, unmounting script tags leaves an initialized SDK running. The wrapper rejects new calls and checks consent before flushing, but it cannot stop SDK autocapture by itself. An implementation supporting withdrawal without a reload must cancel initialization timers, discard pending jobs, and call `opt_out_capturing()`; reacceptance uses `opt_in_capturing()`. These APIs and the `loaded` callback are documented in the [PostHog JavaScript SDK](https://posthog.com/docs/libraries/js).
 
-> NOTE: unverified method name. The reference only stops rendering. It never calls an opt-out API and it never clears the retry timer. Confirm `opt_out_capturing` on the current snippet. A reload with a stored rejection never loads the script, which is the path the reference actually implements.
+> NOTE: the reference unmounts the snippet but does not opt out the already-running SDK, cancel its initialization timer, or clear pending jobs on withdrawal. A reload with rejection stored never loads the snippet. Do not describe live withdrawal as fully implemented.
 
 ## CSP (P21)
 
@@ -143,7 +144,35 @@ No server token. No personal API key in the browser.
 
 `capture_pageview: true` records the page view the snippet sends. The repo has no `utm_` reader and no campaign column. Leave that parser out.
 
-The repo has no `posthog.identify`, `group`, or `alias`.
+## Identity, readiness, and custom events (P44)
+
+Data flow: consent choice -> script/init -> readiness notification -> queued wrapper calls -> SDK. Independently, session state -> identity effect -> the same wrapper. Logout clears the wrapper queue before resetting SDK identity.
+
+| Wrapper operation | Input shape | Gate and effect |
+| --- | --- | --- |
+| `identifyUser` | Stable auth id, optional email person property | Drop an empty id or absent consent; queue until ready; call `identify(id)` or `identify(id, properties)` |
+| `capture` | Event name plus optional scalar properties | Same consent/readiness gates; SDK failures never break the user action |
+| `resetAnalytics` | No event payload | Clear pending calls even before initialization; attempt SDK `reset` regardless of current consent |
+
+The readiness gate in the reference checks `window.posthog.__loaded` and flushes on an application readiness event emitted by `loaded`. `__loaded` is an SDK internal flag, not an application contract. An adaptation can track readiness in its own module from the public `loaded` callback instead. Listen before initialization and handle the already-ready case.
+
+Queued calls are browser-memory jobs, not a durable event log. No consent means drop immediately, never queue for future acceptance. With consent but no ready client, enqueue in arrival order. At flush, recheck consent, drain once, and isolate exceptions per job. A failed analytics call is swallowed; it is not retried. A page close loses pending calls. The reference has no queue size/age bound and leaves jobs pending if consent is withdrawn before readiness; bound/discard them when adapting this mechanism.
+
+Mount the identity effect inside the session provider. Run it when the auth id or optional email changes, and again on consent acceptance or readiness. Remove its listeners on cleanup. Repeated callbacks can identify the same user again; do not promise exactly-once delivery or that every earlier capture was already identified. If event attribution requires identity first, establish it before releasing that session's captures.
+
+Use the auth subject as the distinct id; optional email is a person property, never the sole identity key. No `group` or `alias` path is implemented. Generic call sites use the wrapper:
+
+```ts
+identifyUser(session.userId) // called by the session effect after mount
+capture("item_saved", { analyzed: false }) // after confirmed save success
+capture("upgrade_clicked", { surface: "editor" }) // at the user action
+// At logout, before submitting the sign-out action:
+resetAnalytics()
+```
+
+Attach reset to every logout/account-switch path. The reference clears pending jobs and attempts SDK reset from the logout form's submit handler. That does not prove that session expiry or every future sign-out path resets identity. [PostHog documents stable identity and logout reset](https://posthog.com/docs/libraries/js); reset does not erase the application's separate consent record.
+
+Keep event properties to coarse enums, booleans, and counts. The wrapper's property type is `Record<string, string | number | boolean | null>`; it is not a content scrubber. Call sites still choose what to send. A public CTA listener can capture public pathname, coarse placement, and intent after consent. It must omit query strings, referrer paths, private text, and private detail URLs; do not reuse public pathname capture across authenticated routes. Emit completed-action events after success rather than on every render. These are reusable event rules, not a product event catalog.
 
 ## Setup
 
@@ -152,7 +181,8 @@ The repo has no `posthog.identify`, `group`, or `alias`.
 3. Add the snippet. Start `enabled` at false. Load `array.js` only after consent and a non-empty key.
 4. Init with `identified_only`, autocapture, page views, page leaves, and session recording off.
 5. Confirm the CSP wildcards cover the asset host and the API host, or append the custom origin (`content-security-policy`, P21).
-6. Mount the banner and the snippet in each root layout.
+6. Mount the banner and snippet in each root layout. Mount identity inside the authenticated session provider, register readiness/consent listeners, and reset pending work plus SDK identity on logout.
+7. Route explicit events through the gated wrapper; add coarse properties at the action outcome. Exercise delayed readiness, rejection, and logout before enabling the project key.
 
 ## Failure prevention
 
@@ -161,9 +191,10 @@ The repo has no `posthog.identify`, `group`, or `alias`.
 - Treat a missing key as off, even when the visitor accepted analytics.
 - Store a rejection as `analytics: false` so the banner stays dismissed for 180 days.
 - Remove expired and corrupt consent keys.
-- Leave `person_profiles` at `identified_only` while nothing calls `identify`.
+- **P44.** `identified_only` permits identified profiles. Gate stable-id identification and custom events on consent/readiness; clear queued identity and events before resetting on logout. Analytics exceptions cannot fail the product action.
 - Leave session recording disabled.
-- On a later rejection in the same page, stop the retry. Call the snippet's opt-out only after confirming the method name. The reference relies on a reload.
+- On same-page withdrawal, stop initialization timers, clear pending work, and opt out the SDK. Wrapper gating alone does not stop automatic capture. The reference has this limitation.
+- Queueing provides no durable delivery or exact ordering against automatic page views. Bound queued jobs and discard stale jobs across account changes.
 - Do not parse `utm_` parameters. The app does not.
 
 ## Tests
@@ -174,13 +205,19 @@ Snippet: with consent false, or with an empty key, the script tag is absent. Wit
 
 Banner: the first render is not visible. After mount with empty storage it is visible. Accept and reject both hide it and write the matching flag.
 
+Wrapper checks already in the reference unit suite: consent off drops capture; loaded + consent sends scalar properties; delayed initialization queues and the ready event flushes; identify uses a stable id with or without the optional email property; reset attempts SDK reset on logout.
+
+Additional acceptance cases for an adaptation (not claims about existing coverage): repeated ready events do not replay drained jobs; logout before readiness drops queued identity/captures; server calls and empty ids do nothing; one SDK exception does not block the next job; consent withdrawn before ready never flushes; withdrawal after load stops automatic capture through SDK opt-out. Exercise account A logout then account B login to ensure no queued A event crosses the identity boundary. The public CTA test should assert only coarse properties, and an unconsented click sends nothing.
+
 ## Checklist
 
 - [ ] Consent is `localStorage`, 180 days, with an explicit true or false.
 - [ ] Banner and snippet do not read `window` during render.
 - [ ] Snippet loads only after acceptance and only when the project key is set.
 - [ ] Init uses `identified_only`, autocapture, pageview, pageleave, and recording off.
-- [ ] No `identify` call and no UTM parser.
+- [ ] Stable auth id is identified only after consent/readiness; optional properties stay separate. No UTM parser.
+- [ ] Delayed calls flush once; logout clears pending identity/events and resets the SDK (P44).
+- [ ] Public CTA properties omit query/referrer/private content; custom captures cannot interrupt actions.
 - [ ] CSP allows the asset host and the API host, with `'unsafe-inline'` on `script-src`.
-- [ ] A rejection after load stops the retry. A reload with analytics false never loads the script.
+- [ ] Live withdrawal cancels timers, clears queued jobs, and opts out SDK capture; record the reference gap if adapting later. A reload with analytics false never loads the script.
 - [ ] Both root layouts mount the banner and the snippet.
