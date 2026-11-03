@@ -1,13 +1,13 @@
 ---
 name: pgvector-similarity-search
 title: pgvector cosine search with a typed query vector
-summary: Store 384-dimension embeddings and rank rows with cosine distance, casting the query to extensions.vector so the non-superuser API role can run the operator. Use this for semantic search over a user's items, a shared catalog, past chat turns, and knowledge chunks.
+summary: Rank compatible embeddings with typed pgvector cosine queries and calibrate task cutoffs per model, version, dimension, and corpus. Use for semantic search and RAG over private items, a shared catalog, chat turns, or knowledge chunks.
 stack: [django, postgres, pgvector]
-tags: [search, embeddings, pgvector]
+tags: [search, embeddings, pgvector, retrieval, calibration]
 requires: [supabase-rls-client-reads]
 related_skills: [ai-chat-with-memory]
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # pgvector cosine search with a typed query vector
@@ -24,7 +24,7 @@ flowchart LR
   Embed[Embedding client]
   DB[(Postgres app_api)]
   API -->|user id from JWT| DB
-  API -->|query text, max 500 chars| Embed
+  API -->|semantic branch only, query text| Embed
   Embed -->|384 floats| API
   API -->|cosine distance, typed cast| DB
 ```
@@ -35,7 +35,7 @@ Response JSON is built by one serializer per entity. That serializer drops the v
 
 ## Schema
 
-Every vector column is `vector(384)`, nullable. A null means "not embedded yet" and is excluded from search.
+The reference vector columns are `vector(384)`, nullable. Choose a dimension supported by the selected model and keep the column, client validation, query and corpus consistent. A null means "not embedded yet" and is excluded from search. A matching dimension validates shape, not model compatibility.
 
 | Table | What is embedded | Extra filters |
 | --- | --- | --- |
@@ -131,7 +131,7 @@ class CosineDistance(Func):
         )
 ```
 
-`float(x)` is what keeps user text out of the SQL literal. Pass a sequence of numbers, or a bracket literal you already validated. Similarity is `1 - distance`. Higher is closer. A null distance becomes similarity `0` and fails the threshold.
+`float(x)` is what keeps user text out of the SQL literal. Pass a sequence of numbers, or a bracket literal you already validated. Similarity is `1 - distance`; higher is closer. Cosine similarity can be negative and is not a probability. The [pgvector query documentation](https://github.com/pgvector/pgvector#querying) defines the distance operator and conversion. The reference maps a null distance to `0`, which its positive floors exclude; an adaptation allowing nonpositive floors should explicitly exclude null distances.
 
 ## Queries
 
@@ -139,7 +139,29 @@ Scope every user-owned query with the JWT subject. Order by distance ascending. 
 
 Because similarity is `1 - distance`, taking the nearest `limit` rows and then dropping those under the threshold returns the same set as filtering in SQL and then limiting. Item search and chat search do the filter in Python after the slice. Catalog search filters `vector_score >= threshold` in SQL, then paginates. Both are safe only while the score stays monotonic with distance.
 
-Item search defaults: service threshold `0.7`, limit `50`. The repository default, used by retrieval that is not the search box, is threshold `0.6` and limit `5`. Catalog search from the search box uses `0.6`. The catalog method's own default, when the caller passes no threshold, is `VECTOR_MIN_SCORE = 0.3`. Chat retrieval uses `0.6` and limit `5`.
+Keep semantic-search policy at the task boundary. The public search service passes a fixed floor and cap for each collection, independently of repository defaults. Its request `limit` bounds keyword hits; the semantic branch uses the service cap, which can exceed a smaller requested limit. The API still parses and forwards `threshold`, but the service does not use it. Accepting a field does not make it an effective ranking control.
+
+RAG callers have a separate policy: the reference item/chat/knowledge repositories default to `0.5`, and the context caller explicitly passes that value for past-chat retrieval. Public search overrides repository defaults; a catalog repository fallback such as `VECTOR_MIN_SCORE` is not the public search contract. These observed values are not quality targets for another embedding model. In a new implementation, pass a validated task policy explicitly, and document whether the request limit also bounds semantic results.
+
+Fresh generic policy shape, populated from evaluation rather than copied scores:
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class RetrievalPolicy:
+    embedding_profile: str
+    min_similarity: float
+    max_results: int
+
+    def __post_init__(self):
+        if not self.embedding_profile:
+            raise ValueError("embedding profile is required")
+        if not -1 <= self.min_similarity <= 1 or self.max_results < 1:
+            raise ValueError("invalid retrieval policy")
+```
+
+`embedding_profile` is a proposed deployment identifier for model/version/dimension and preprocessing; the reference rows do not currently store this identifier. A repository would receive `threshold=policy.min_similarity` and `limit=policy.max_results` only after confirming corpus/query profile compatibility.
 
 ```python
 def has_embedding(embedding) -> bool:
@@ -164,7 +186,7 @@ async def find_similar_items(user_id, embedding, *, limit, threshold, mood, star
 
 `days` means "older than this many days", measured from the client clock `reference_now`. Server `now()` is the wrong clock for that window.
 
-Chat search adds `audience_id` (the catalog item this thread is with) and `exclude(thread_id=current)`. A short follow-up can reuse the newest stored vector for that thread instead of embedding a thin message:
+Chat search adds a catalog-item id (the entity this thread is with) and `exclude(thread_id=current)`. When retrieval text is empty, the reference reuses the newest stored vector for that thread instead of calling the embedding provider:
 
 ```python
 row = await ChatTurn.objects.filter(
@@ -183,7 +205,17 @@ Catalog visibility, applied before the score filter:
 
 Catalog vector search returns `[], 0` when the query vector is missing. Hybrid search can still rank on text; that path is `lexical-search`.
 
-Routing shared with lexical search: count tokens in the query. One to three tokens try the keyword ranker first. Zero hits, or four or more tokens, use this vector path. Item keyword search loads that user's decrypted rows into memory. Catalog keyword search is the hybrid of `tsvector` and this distance.
+Routing shared with `lexical-search`: count non-stopword tokens. One to three tokens try the keyword ranker first. Positive hits return without generating a query vector. A miss or a longer query embeds once, then runs this vector path with the task floor/cap. Item keyword search loads that user's decrypted rows into memory; catalog keyword search uses only the stored `tsvector` and a positive full-text rank. The optional hybrid repository helper is not called by the current public search service. Blank input is rejected by the API; a nonblank zero-token query skips keyword and reaches the semantic branch.
+
+## Setup and calibration (P46)
+
+1. Install the extension and app-role privileges from `supabase-rls-client-reads`, then create the vector columns. Verify a typed query using the app role before loading a corpus.
+2. Define an embedding profile: provider, resolved model/version, dimension, document preprocessing/truncation, query preprocessing and any paired query/document task settings. Record it with the corpus or deployment. Use one compatible space for writes, backfills and queries. Matching vector lengths do not make different models interchangeable. Google's [embedding migration guidance](https://aistudio.google.com/docs/embeddings#migration) gives an explicit incompatible-space example requiring re-embedding.
+3. Prepare labeled queries and relevant row ids per corpus/task, including short names, paraphrases, multilingual text and queries with no relevant answer. Use synthetic or authorized evaluation data. Keep evaluation inputs out of public examples and logs.
+4. For each candidate model/version/dimension, embed the corpus and queries consistently. First compare top-k rankings with no score floor: measure recall@k and a ranking metric such as MRR or nDCG. Then sweep floors at the intended cap, measuring relevant results retained, precision, empty-result rate and latency on held-out queries. Evaluate each collection and RAG task separately.
+5. Select and version the task floor/cap against that profile and labeled evaluation. Compare rankings and recall across models, not raw cosine magnitudes. A larger dimension or a larger score does not establish better relevance; lowering a floor cannot repair incompatible vectors.
+6. On a model/version/dimension or preprocessing change, re-embed consistently into a separate collection/column or isolate rows by profile. Backfill and verify coverage before switching the query encoder and corpus together. Keep the previous compatible pair available for rollback. The reference has no automatic profile isolation or coordinated model-switch mechanism.
+7. Monitor result counts, empty-result rates, latency and embedding failures by task/profile without logging private queries. Re-evaluate on corpus drift. Constant test vectors check plumbing only; they cannot validate relevance or a production cutoff.
 
 ## Wire format
 
@@ -213,7 +245,8 @@ A list endpoint and a detail endpoint both call the same function. A second mapp
 - **P12.** A vector from the ORM or from NumPy has no boolean value. `if embedding` raises. Test `embedding is not None` and then `len(embedding) > 0`. Use that helper before similarity search and before any job that reads a stored vector. A Python `list[float] | None` from the embed client is safe to length-check the same way.
 - **P23.** One serializer per entity. Strip `embedding` and the internal timestamp there. Clients never see vector columns. Review any new `asdict` or `values()` response before it ships.
 - Filter user-owned tables on the JWT subject. `app_api` can read every row.
-- Reject a vector whose length is not 384. Mixed dimensions make `<=>` fail or return nonsense.
+- **P46.** Recalibrate cutoffs per model/version/dimension and corpus/task with labeled ranking/recall evaluation. Never mix embedding spaces, even at equal dimensions. Re-embed or isolate versions before switching readers and writers.
+- Reject a vector whose length differs from the configured dimension (384 in the reference). A dimension mismatch fails; an equal-length vector from the wrong model can silently produce irrelevant rankings.
 - Keep the query literal numeric. Build it with `float(x)` or pass a bound parameter that is still cast with `::extensions.vector`.
 - Item save: if embed throws, fail the save. A stored body with a null vector cannot be found later.
 - Search embed: if the provider throws, return an empty semantic result. Do not fail the whole request when a keyword result was already empty and the provider is down.
@@ -231,7 +264,10 @@ Run the SQL as `app_api`.
 - `embed` raises when the provider returns a length other than 384.
 - `ENV=test` returns the constant vector and does not call the provider.
 - Serializer output has no `embedding` key and no internal timestamp field. A catalog payload has no owner id.
-- A query of four tokens does not call the keyword ranker. A query of two tokens uses keyword results when that ranker returns a row, and falls through to cosine when it returns none.
+- A query of four tokens does not call the keyword ranker. A query of two tokens with positive keyword hits calls neither embedding nor vector search. A miss generates one embedding and uses the service-owned floor/cap, regardless of a legacy request threshold.
+- Repository defaults and service overrides are tested independently. A smaller request limit still leaves the reference semantic cap unchanged; document this behavior explicitly.
+- A proposed profile guard rejects same-dimension vectors from another model/version; the reference dimension check alone does not. A model-switch rehearsal verifies full backfill coverage and paired rollback.
+- A labeled evaluation reports recall@k before and after the floor, a ranking metric and empty-result rate per task/profile. Unit tests with identical vectors do not substitute for this evaluation (P46).
 
 ## Checklist
 
@@ -239,7 +275,9 @@ Run the SQL as `app_api`.
 - [ ] Columns are `vector(384)`, nullable. The client rejects any other length.
 - [ ] Distance uses `CastToVector` / `::extensions.vector`, including queries that used to call `pgvector.django.CosineDistance`.
 - [ ] User-owned searches filter on the JWT subject. Catalog searches apply the publish rules.
-- [ ] Thresholds match the caller: item search `0.7`, catalog search box `0.6`, chat `0.6`, catalog default `0.3`.
+- [ ] Task floors/caps are calibrated and versioned with the embedding profile (P46). Public search overrides, RAG defaults and the unused legacy request threshold are distinguished.
+- [ ] Query and corpus use compatible model/version/dimension/preprocessing; model changes re-embed or isolate rows and switch the pair together.
+- [ ] Short keyword hits skip embedding; semantic request-limit behavior is documented.
 - [ ] Item save embeds the body only and aborts on failure. Search and catalog embeds truncate to 500 characters. Chat-turn vectors use the labeled question and answer with no cap.
 - [ ] Vector checks use `is not None` and `len` (P12).
 - [ ] Every response serializer drops the vector and the internal timestamp (P23).

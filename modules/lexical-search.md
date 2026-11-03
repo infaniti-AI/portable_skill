@@ -7,12 +7,12 @@ tags: [search, full-text, bm25]
 requires: []
 related_skills: []
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Keyword search for encrypted items and a catalog tsvector
 
-Short queries (one to three tokens) are keyword queries. Longer queries go straight to embeddings (`pgvector-similarity-search`). Zero tokens match nothing.
+Short queries (one to three non-stopword tokens) try keywords first. Positive hits return without embedding. A miss or a longer query goes to embeddings (`pgvector-similarity-search`). The API rejects blank input; nonblank input with zero counted terms skips keyword and reaches embeddings, so zero terms do not guarantee an empty overall result.
 
 Two indexes exist because the data is different:
 
@@ -40,9 +40,36 @@ Item search:
 
 Catalog search:
 
-1. Always embed the query. A provider failure leaves the vector null. Hybrid can still rank on text.
-2. When `use_keyword` is true, run hybrid search. A non-empty page is mode `keyword`.
-3. Otherwise, or when hybrid returns nothing, run pure vector search at threshold `0.6`, mode `embedding`.
+1. When `use_keyword` is true, run full-text search over visible rows, with page size equal to the requested keyword limit. Keep only positive text ranks; there is no vector score or semantic floor in this branch.
+2. A non-empty page returns mode `keyword` immediately. Call neither the embedding client nor vector/hybrid search.
+3. A keyword miss or a longer query embeds once (at most 500 characters in the reference), then calls pure vector search with the task's fixed semantic floor/cap, mode `embedding`. A failed embed leaves no vector, so the repository returns an empty page.
+
+The reference service's semantic floor/cap is independent of the request keyword limit and repository defaults. The API accepts `threshold` for compatibility but the service ignores it. See `pgvector-similarity-search` for task policy, RAG boundaries and model-specific recalibration (P46). Do not apply a semantic cutoff to a positive full-text rank.
+
+Fresh generic orchestration example; `semantic_policy` is supplied by the task configuration:
+
+```python
+async def search_catalog(query, *, keyword_limit, semantic_policy, engine, repo, embed):
+    if not query.strip():
+        raise ValueError("query is required")
+    if use_keyword(engine.count_terms(query)):
+        rows, _ = await repo.keyword_search(
+            query_text=query, page=1, page_size=keyword_limit,
+        )
+        if rows:
+            return rows, "keyword"
+    vector = await embed(query[:500])
+    if vector is None or len(vector) == 0:
+        return [], "embedding"
+    rows, _ = await repo.vector_search(
+        query_embedding=vector, page=1,
+        page_size=semantic_policy.max_results,
+        threshold=semantic_policy.min_similarity,
+    )
+    return rows, "embedding"
+```
+
+The example requires repository methods to enforce visibility and the embed adapter to handle provider failures. It explicitly stops on a missing vector; the reference catalog service instead calls its repository with `None`, which returns `([], 0)`.
 
 ## In-memory BM25
 
@@ -183,7 +210,15 @@ python manage.py backfill_catalog_search_vector --dry-run
 
 Iterate with `iterator(chunk_size=batch_size)` and `UPDATE` one id at a time. Dry-run counts rows and writes nothing. The command's job is to recompute every row from name and metadata. There is no trigger in the current migrations to keep the column fresh.
 
-## Hybrid rank
+## Positive full-text rank
+
+The keyword repository segments the query, returns `([], 0)` if it becomes blank, and builds `SearchQuery(..., search_type="websearch", config="simple")`. Apply visibility before counting or paging, match `search_vector` against that query, then annotate `SearchRank` with `normalization=32`, `cover_density=True` and a `Coalesce` fallback of `0.0`. Keep `text_rank > 0` and order by text rank, popularity counters and creation time descending. Count before slicing, then paginate with `offset = max(page - 1, 0) * page_size`.
+
+No embedding column or cosine expression participates, so a visible matching row with a null embedding can still be found. PostgreSQL documents [rank normalization](https://www.postgresql.org/docs/current/textsearch-controls.html#TEXTSEARCH-RANKING): option 32 maps rank to `rank / (rank + 1)` without changing order. It is not a probability or a cosine score; do not compare those scales.
+
+## Optional hybrid rank
+
+The repository retains a hybrid helper, but the current public search service does not call it. Use it only when an explicit caller chooses combined scoring and evaluates that policy. The following settings describe that separate helper, not short-query routing:
 
 Settings:
 
@@ -214,7 +249,14 @@ hybrid_score = vector_weight * vector_score + text_weight * text_rank
 
 `vector_score` is `1 - cosine_distance` when the row has an embedding, else `0`. Keep `hybrid_score > 0.3`. Order by hybrid score, then likes, then related-comment count, then `created_at`, all descending. Paginate with `offset = max(page - 1, 0) * page_size`.
 
-Pure vector search, used for long queries and for a hybrid miss, filters `vector_score >= threshold` in SQL (search box passes `0.6`), requires a query vector, and returns `[], 0` without one. Check the vector with `is not None` and a length test when the value came from the ORM (`pgvector-similarity-search`, P12). A `list[float] | None` from the embed client is empty when it is `None`.
+Pure vector search, used by the public service for long queries and keyword misses, filters `vector_score >= threshold` in SQL with the service-owned task floor/cap, requires a query vector, and returns `[], 0` without one. Check the vector with `is not None` and a length test when the value came from the ORM (`pgvector-similarity-search`, P12). A `list[float] | None` from the embed client is empty when it is `None`.
+
+## Setup order
+
+1. Add the nullable catalog `search_vector` column, then deploy the shared ICU segmentation helper and application writer. Private item text remains ciphertext; do not create a plaintext persistent index for it.
+2. Backfill catalog vectors and compare representative multilingual stored/query tokens before routing traffic to the keyword repository. An optional GIN index changes access cost, not the ranking contract.
+3. Wire short-query routing to the positive full-text method. Keep optional hybrid callers explicit. Configure the semantic fallback through `pgvector-similarity-search`, including model/profile calibration.
+4. Verify user scoping, publish visibility, no embedding on a keyword hit, and exactly one embedding on a miss/long query. Then monitor empty pages and latency without persisting decrypted corpora or private queries.
 
 ## Failure prevention
 
@@ -226,6 +268,7 @@ Pure vector search, used for long queries and for a hybrid miss, filters `vector
 - Return only BM25 scores greater than zero. A zero-score row is not a keyword hit, and the caller then tries embeddings.
 - Share `search_path` `public, extensions` with the vector role when hybrid search runs both `tsvector` and `<=>`.
 - Gate ORM vectors with `is not None` and `len`, never with a bare boolean test.
+- **P46.** Keyword ranks need only be positive; semantic floors are task/model policies. Preserve the no-embedding fast path and recalibrate the semantic fallback using `pgvector-similarity-search`. A provider outage must not prevent keyword hits from returning.
 
 ## Tests
 
@@ -236,16 +279,20 @@ Pure vector search, used for long queries and for a hybrid miss, filters `vector
 - An empty corpus, a blank query, and a corpus of empty documents each return no rows.
 - Catalog: a query segmented the same way as the stored name matches weight A. A query that skips segmentation misses a space-less name that the stored vector split.
 - Hybrid score uses `0.25 * vector + 0.75 * text` and drops rows at or below `0.3`.
-- A short query with a hybrid miss falls through to vector search. A long query never calls hybrid.
+- A short catalog query with positive text matches returns mode `keyword`, respects the keyword request limit, and calls neither embedding nor vector/hybrid search. Include a matching row with null embedding and a low positive text rank.
+- A short miss and a four-token query each embed once and call vector search with the configured task floor/cap. The long query skips keyword; neither route calls hybrid. A legacy request threshold cannot change the reference semantic floor.
+- A provider failure still allows short keyword hits to return. After a keyword miss it yields empty semantic results. Blank API input is rejected; nonblank zero-term input skips keyword.
+- Keyword count and results exclude unpublished, paused or deleted custom catalog rows. Integration tests should exercise the positive-rank method, not only the retained vector helper.
 - Backfill dry-run writes nothing and reports the row count. A second backfill leaves an already-correct vector unchanged.
 - Item keyword search never returns another user's rows.
 
 ## Checklist
 
-- [ ] `count_terms` uses the ICU breaker and the English stopword list. Routing is `1..3` tokens for keyword, otherwise embeddings.
+- [ ] `count_terms` uses ICU and English stopwords. `1..3` tokens try keyword first; positive hits skip embedding, and misses/long queries embed once.
 - [ ] Item BM25 runs on decrypted text in memory. Weights are title ×3, topics ×2, body ×1. HTML is stripped.
 - [ ] Snowball covers the ISO map above. Other languages pass through. The query is stemmed for every language in the corpus.
 - [ ] Catalog `search_vector` uses config `simple` on pre-segmented text, weights A/B/C, and is written on create, update, and backfill.
-- [ ] Hybrid weights are `0.75` text and `0.25` vector, cutoff `0.3`, candidate pool `max(page * page_size * 4, 50)`.
+- [ ] Catalog keyword search uses visible rows and `text_rank > 0`, without vector scoring. Optional hybrid configuration is separate from public routing.
+- [ ] Semantic floors/caps are task-owned and model-calibrated (P46); the legacy request threshold is not advertised as effective.
 - [ ] `search_path` includes `extensions` when the same role runs cosine distance.
-- [ ] Tests cover stemming, CJK segmentation, the hybrid miss, and user scoping.
+- [ ] Tests cover stemming, CJK segmentation, keyword-hit call avoidance, one-embed fallback, visibility and user scoping; optional hybrid scoring is tested separately.
