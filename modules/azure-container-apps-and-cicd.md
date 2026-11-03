@@ -7,7 +7,7 @@ tags: [deploy, ci, containers]
 requires: [migration-safety]
 related_skills: []
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Container Apps release with GitHub OIDC
@@ -34,7 +34,7 @@ flowchart TD
 
 | App | Command | Ingress | Scale |
 | --- | --- | --- | --- |
-| API | `uvicorn app.asgi:application --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 30` | Internal, port 8000. Not reachable on the public `azurecontainerapps.io` name | HTTP, 50 concurrent requests. Min 1, max 3. 1 vCPU, `2Gi` |
+| API | `uvicorn app.asgi:application --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 --timeout-graceful-shutdown 30` | Internal, port 8000. Not reachable on the public `azurecontainerapps.io` name | HTTP, 50 concurrent requests. Min 1, max 3. 1 vCPU, `2Gi` |
 | Worker | `python -m dramatiq run_workers --processes 1 --threads 8` | None. No HTTP probes | Redis list `dramatiq:default`, length `8`. Min 2, max 4. 1 vCPU, `2Gi` |
 | Tunnel | `cloudflared tunnel --no-autoupdate run` | None | Min 2, max 2. 0.25 vCPU, `0.5Gi`. Image tag pinned in Terraform |
 
@@ -116,11 +116,11 @@ Key Vault ids are versionless (`${vault_uri}/secrets/${name}`), so they name the
 
 ## Network and probes
 
-API ingress is `internal`: `external_enabled` is false. Clients reach the API through the tunnel. The tunnel's origin `Host` is the internal FQDN. The public `azurecontainerapps.io` name is not a client `Host`.
+API ingress is `internal`: `external_enabled` is false. Clients reach the API through the tunnel. The intended origin `Host` is the internal FQDN; the external tunnel route must actually send an approved host. Terraform outputs alone do not prove that route configuration. See `cloudflare-tunnel` for Host versus origin TLS configuration and `http-keepalive-econnreset` for idle connection recovery.
 
 `GET /health/` and `GET /` return `{"status": "healthy"}`. Both paths are auth-exempt and rate-limit exempt. Probes are HTTP on port 8000, path `/health/`, with header `Host: localhost`. Django answers 400 when that host is missing from `ALLOWED_HOSTS`.
 
-The production settings module always includes `localhost` and `127.0.0.1`, then the public hostname and the internal FQDN, then every token in `DJANGO_ALLOWED_HOSTS`. The reference file inlines the public and internal names. Terraform's hostname list defaults to empty and is only appended. A second environment replaces the inlined names. Production boot rejects an `ALLOWED_HOSTS` entry of `*`.
+The production overlay replaces the base allowed-host list with inline approved public/internal hosts and probe hosts (`localhost` and `127.0.0.1`), then appends stripped nonempty entries from `DJANGO_ALLOWED_HOSTS`. An env list cannot remove those inline approvals. Current Terraform has no extra-host variable/list, env injection or allowed-host output. For another environment, deliberately configure its approved origin hosts and preserve the probes; the env-driven adaptation is in `django-settings-and-env`. Production boot rejects `*`.
 
 Browser CORS is not how the web server calls this API. `CORS_ALLOW_ALL_ORIGINS` is false. The reference list is a placeholder origin. Opening it does not fix a server-to-server call.
 
@@ -195,7 +195,6 @@ Plain env (not secrets), set in Terraform:
 | Name | Value |
 | --- | --- |
 | `DJANGO_SETTINGS_MODULE` | Production settings module |
-| `DJANGO_ALLOWED_HOSTS` | Comma-separated hostnames, no scheme |
 | `AZURE_OPENAI_ENDPOINT` | Foundry endpoint URL |
 | `AZURE_EMBEDDING_DEPLOYMENT` | Deployment name |
 | `LLM_PROVIDER` | `azure` or `gemini` |
@@ -256,13 +255,13 @@ The unit job supplies a throwaway `FIELD_ENCRYPTION_KEY` (64 hex characters) and
 
 The k6 harness is not a job in this workflow or in the release workflow (`k6-backend-load`). The integration job is skipped when `github.event.pull_request.head.repo.full_name` is not this repository, so a fork pull request does not start the local stack. `supabase stop --no-backup` is `if: always()`. The CLI action in the reference uses `version: latest`. Pin a CLI version so a new release does not change the database under the tests.
 
-`pip-audit` may carry a temporary `--ignore-vuln` while a dependency pin blocks the fix. The advisory id and the pin that forces it belong in a comment on that step. Remove the ignore when the pin lifts. Coverage upload uses `fail_ci_if_error: false`.
+The strict `pip-audit` gate retains explicit advisory exceptions; dependency upgrades can remove individual exceptions without changing the gate. Record each exception's reason and blocking pin beside the step, then remove it when the constraint lifts. A passing audit with exceptions does not establish a vulnerability-free lock. Coverage upload uses `fail_ci_if_error: false`.
 
 The lockfile must compile cleanly (P36). `requirements.txt` is the output of `pip-compile` on `requirements.in` with Python 3.13. Generate it from that input. A hand-edited pin that contradicts another extra fails the next compile. The reference CI installs the committed lock and does not run `pip-compile`. Add a job that compiles from `requirements.in` and fails when the lockfile would change.
 
 ## Web pull-request CI
 
-Trigger: pull request to `main`. Node 20. `pnpm/action-setup` runs before `actions/setup-node` with `cache: pnpm`. Install with `pnpm install --frozen-lockfile`.
+Trigger: pull request to `main` or `dev`. Node 20. `pnpm/action-setup` runs before `actions/setup-node` with `cache: pnpm`. Install with `pnpm install --frozen-lockfile`.
 
 Workflow env:
 
@@ -284,25 +283,9 @@ Jobs, with lint and build independent of the test chain:
 
 The build job evaluates third-party clients at import. Set these names to non-secret placeholders that satisfy those clients' shape checks, and point the site URL at `http://localhost:3000`: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL`. Use a URL on `example.invalid` for the Supabase settings. Do not point the build at a real project.
 
-Playwright is offline. One mock API, one mock auth server, and `page.route()` for browser calls. No real backend and no third-party network.
+Both production build paths need CMS data. The standalone Build job starts a local Notion-compatible mock, healthchecks it before `pnpm run build`, and cleans up its child with an EXIT trap. It supplies a synthetic `NOTION_API_KEY` and server-only `NOTION_API_BASE_URL`; a missing production key remains an error. Import placeholders alone do not supply a valid published article.
 
-```ts
-export default defineConfig({
-  fullyParallel: true,
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 0 : 1,
-  workers: process.env.CI ? 1 : undefined,
-  webServer: [
-    { command: "node tests/integration/servers/mock-backend.mjs", timeout: 30_000 },
-    { command: "node tests/integration/servers/mock-supabase.mjs", timeout: 30_000 },
-    {
-      command: "rm -rf .next/cache && pnpm run build && pnpm run start",
-      timeout: 300_000,
-      reuseExistingServer: !process.env.CI,
-    },
-  ],
-})
-```
+Playwright application requests stay local: mock API, mock auth, mock CMS, and `page.route()` for browser API calls. Its `webServer` list starts and awaits health for the three mocks before the Next build/start entry. The real converter and publication loader read synthetic blocks; article HTML and sitemap membership are asserted. The standalone Build job owns only its CMS child, not the full API/auth test stack. Harness configuration, readiness ordering, credential matching, telemetry suppression and fixture limits belong to `nextjs-testing`; keep that module as the single setup guide (P50).
 
 `fullyParallel: true` with more than one worker runs specs against one in-memory mock. Specs then delete rows another spec is reading, and a cached miss sticks for the cache TTL (P27). CI sets `workers` to 1. A local parallel run needs a fixture store per worker. `reuseExistingServer` is false when `CI` is set, so CI always boots a new stack.
 
@@ -316,7 +299,8 @@ Integration HTML report and failure screenshots are uploaded with `if: always()`
 
 - **P11.** A release runs `check_migration_safety` with no allow flag, then migrates, then builds. Dispatch with the flag migrates and does not update a container. Applied files stay in place. The rest of the rule is `migration-safety`.
 - **P26.** `NODE_OPTIONS=--max-old-space-size=4096` on the web workflow and on the Playwright web server. Integration starts `pnpm run build && pnpm run start` after deleting `.next/cache`.
-- **P27.** CI Playwright `workers` is 1 while `fullyParallel` is true. One mock process holds the rows. Local parallel runs isolate that store per worker.
+- **P27.** CI Playwright `workers` is 1 while `fullyParallel` is true. Shared mock state holds the rows. Local parallel runs isolate that store per worker.
+- **P50.** Start/healthcheck the CMS mock before both production build paths. Use a matching synthetic credential and server-only endpoint override; do not bypass publication validation. See `nextjs-testing`.
 - **P30.** Deploy `main-` plus the 7-character SHA and a new revision suffix. Fail the job when the latest revision's image string differs. Confirm that revision is healthy before calling the release done. `:main` and `:latest` are not deploy tags. Terraform ignores later image changes.
 - **P36.** The lockfile must compile cleanly from `requirements.in`.
 
@@ -329,6 +313,8 @@ Integration HTML report and failure screenshots are uploaded with `if: always()`
 - The worker module has `ingress_mode = none` and probes off. The API probe path is `/health/` and the `Host` header is `localhost`.
 - `pip-compile` on `requirements.in` with Python 3.13 produces no diff against `requirements.txt`.
 - With `CI=1`, the Playwright config reports `workers === 1`, and the web server command contains `pnpm run build && pnpm run start` and does not contain `next dev`.
+- Web PR triggers include `main` and `dev`; the standalone Build job and Playwright each have CMS readiness before build. Article/sitemap assertions exercise actual publication, not an empty-key fallback (P50).
+- Terraform has no obsolete extra-host injection; settings retain probe hosts and append stripped env approvals after the production replacement.
 - A web CI step that unsets `NODE_OPTIONS` is a failed review. The workflow env sets `--max-old-space-size=4096`.
 
 ## Checklist
@@ -336,6 +322,7 @@ Integration HTML report and failure screenshots are uploaded with `if: always()`
 - [ ] Pull-request API CI runs format, the narrow flake8 select, `--names` migration safety, `pip-audit --strict`, bandit high/high, hermetic unit tests at 70 percent, and same-repo integration against a local database.
 - [ ] `requirements.txt` is produced by `pip-compile` from `requirements.in` on Python 3.13, and CI fails when that compile would change the lock (P36).
 - [ ] Web CI sets `NODE_OPTIONS=--max-old-space-size=4096`, installs with a frozen lock, and runs Playwright against `pnpm run build && pnpm run start` with `workers: 1` (P26, P27).
+- [ ] Web PR checks cover `main` and `dev`; both build paths healthcheck the CMS mock first with synthetic credentials and real validation (P50).
 - [ ] A GitHub Release migrates as admin on port `5432` before pushing `main-<7 char sha>` (P11).
 - [ ] `workflow_dispatch` can migrate and cannot build or update a container app.
 - [ ] Deploy updates the API and the worker with that immutable tag and a new revision suffix, then fails unless the latest revision's image matches (P30).
