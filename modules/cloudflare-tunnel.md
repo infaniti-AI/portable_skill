@@ -7,7 +7,7 @@ tags: [network, tunnel, container-apps, security]
 requires: [azure-container-apps-and-cicd]
 related_skills: []
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Outbound Cloudflare Tunnel to an internal Container App
@@ -27,7 +27,8 @@ flowchart LR
   worker[Worker no ingress]
   client --> edge
   connector -->|outbound| edge
-  edge -->|origin Host is the internal FQDN| api
+  edge -->|over established tunnel| connector
+  connector -->|origin request| api
   worker -.->|not on this path| api
 ```
 
@@ -37,7 +38,7 @@ The connector resource has no `ingress` block. Nothing on the environment accept
 
 `ingress_mode = "internal"` sets `external_enabled` false on the shared module. `target_port` is 8000 and transport is `http`. The worker sets `ingress_mode = "none"`, which omits the ingress block.
 
-Opening the API to `external` would publish it on the environment domain and bypass the tunnel. Clients, including the web server, are expected to use the public name that Cloudflare terminates. The platform hostname (`*.azurecontainerapps.io`) is not the `Host` the connector sends.
+Opening the API to `external` would publish it on the environment domain and bypass the tunnel. Clients, including the web server, are expected to use the public name that Cloudflare terminates. The client-facing name and the origin request's `Host` may differ; verify the route configuration rather than inferring the origin header from the public URL.
 
 ## Connector
 
@@ -99,16 +100,20 @@ The secret name in Key Vault is `cloudflare-tunnel-token`. The container environ
 
 ## Host header
 
-The connector's origin request uses the internal ingress hostname as `Host`. Azure manages the certificate for that name. Production `ALLOWED_HOSTS` must include it. It must also include `localhost` and `127.0.0.1`, because API probes send `Host: localhost` (`aca-performance-tuning`).
+The reference production settings expect the internal ingress hostname as the tunnel's origin `Host` and describe Azure's certificate for that name. The route configuration lives outside this Terraform, so the source alone does not prove the deployed header. Inspect the service URL and any `httpHostHeader` override. Cloudflare distinguishes that HTTP header from `originServerName`, the expected origin certificate hostname; check TLS and HTTP routing separately for an HTTPS origin. See [Cloudflare origin parameters](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/origin-parameters/).
 
-The reference production module inlines the public name and the internal FQDN, then appends every token in `DJANGO_ALLOWED_HOSTS`. Terraform's extra-host list is what a second environment should set, and those literals in the settings file have to be replaced there. This module does not record the hostnames. Boot rejects an `ALLOWED_HOSTS` entry of `*`. The full settings overlay is `django-settings-and-env`.
+Production `ALLOWED_HOSTS` must accept the host Django actually receives. Keep probe names `localhost` and `127.0.0.1`; API probes send `Host: localhost` (`aca-performance-tuning`). The current production overlay replaces the imported base list with those probe names and inline approved public/internal names, then appends stripped, nonblank entries from `DJANGO_ALLOWED_HOSTS`. The env extension still works. Terraform no longer declares `custom_hostnames`, constructs an extra-host list, injects `DJANGO_ALLOWED_HOSTS`, or exports that list.
+
+For reuse, replace the deployment literals with an env-driven approved list and explicitly provision `DJANGO_ALLOWED_HOSTS` in each environment. That is an adaptation; the current Terraform does not wire it. Changing the env list in the reference adds names but cannot remove its inline names. Keep exact approved hosts, reject `*`, and verify the final production overlay (`django-settings-and-env`). [Django ALLOWED_HOSTS](https://docs.djangoproject.com/en/5.2/ref/settings/#allowed-hosts) describes host matching and `get_host()` validation.
+
+Intermittent resets after idle reuse have a separate timer/retry diagnostic in `http-keepalive-econnreset` (P45). Host rejection and TLS failures require the routing checks above.
 
 ## Setup
 
 1. Create a remotely managed tunnel. Set the public hostname's origin to the API's internal FQDN (`api_fqdn`). That route lives in Cloudflare, not in this Terraform.
 2. Store the tunnel token in Key Vault as `cloudflare-tunnel-token`. Do not copy the value into Terraform, a workflow, or the API secret map.
 3. Apply the API app first (`ingress_mode = "internal"`), then the connector. The connector `depends_on` the API module.
-4. Allow the internal FQDN on the API. Confirm a request through the public name arrives with that `Host`, and a request to the environment's public name does not reach the API.
+4. Inspect the Cloudflare origin URL, HTTP Host override and HTTPS certificate settings. Allow the observed origin host on the API and retain probe names. For an env-driven adaptation, explicitly wire `DJANGO_ALLOWED_HOSTS`; there is no current Terraform extra-host input. Confirm the tunnel request succeeds and the API remains unreachable directly from outside the environment.
 5. Leave the worker at `ingress_mode = "none"`.
 
 ## Failure prevention
@@ -119,13 +124,16 @@ The reference production module inlines the public name and the internal FQDN, t
 - Pin `cloudflare/cloudflared:<tag>` and pass `--no-autoupdate`. The release job does not roll this app.
 - Keep min and max replicas at 2. Do not attach an HTTP scale rule to an app that has no ingress.
 - Allow the internal origin name and `localhost`. Reject `*`.
+- Inspect the final production list: it replaces the base list, then still appends env entries. Current Terraform does not supply those entries; an env change cannot remove inline approvals.
 - Changing the API app name changes `api_fqdn`. Update the Cloudflare origin to match. Terraform will not do that by itself.
 
 ## Tests
 
 `terraform plan` for the connector shows image `cloudflare/cloudflared:2026.10.2`, command `cloudflared tunnel --no-autoupdate run`, min and max replicas 2, no ingress, and one secret whose env name is `TUNNEL_TOKEN`. The API plan shows `external_enabled` false. The worker plan has no ingress. A static check fails if `connector_secrets` is merged into `all_secrets` or if the API `secret` blocks reference `cloudflare-tunnel-token`.
 
-Settings: production boot raises when `ALLOWED_HOSTS` contains `*`. The allowed list includes `localhost` and the internal FQDN supplied for that environment. Do not assert a hostname literal from another environment.
+Settings: use a synthetic `DJANGO_ALLOWED_HOSTS` list with whitespace and blank entries. The current overlay replaces a sentinel base list, retains its inline approvals and probe names, and appends only stripped nonblank env entries. Its guard raises on `*`. An env-driven adaptation instead contains only probe names plus approved env entries, with no inline deployment names. Do not import real dotenv credentials to test either policy.
+
+Static Terraform review finds no removed extra-host variable, host-list output or host env injection; connector-only token mounting and internal API ingress still hold. Deployment acceptance separately checks the configured origin URL/TLS/Host, a probe request, a tunneled request and external direct-origin isolation. These cannot be proved from Terraform text alone.
 
 ## Checklist
 
@@ -135,3 +143,4 @@ Settings: production boot raises when `ALLOWED_HOSTS` contains `*`. The allowed 
 - [ ] The command is `cloudflared tunnel --no-autoupdate run` with no `--token` argument.
 - [ ] The image tag is pinned. Replica min and max are 2.
 - [ ] `ALLOWED_HOSTS` includes `localhost` and the internal origin name, and rejects `*`.
+- [ ] The route's HTTP Host and HTTPS certificate settings were inspected. The final production overlay accepts that Host; an env-driven adaptation explicitly provisions its host list without retaining deployment literals.

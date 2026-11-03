@@ -1,13 +1,13 @@
 ---
 name: django-settings-and-env
 title: Django settings modules, env boundaries, and the database pool
-summary: Three settings modules (base, production, test) choose hosts and secrets from the environment, keep CONN_MAX_AGE at 0 on the transaction pooler, and fail closed when production boots with dev defaults. Use this when a Django API has a laptop module, a deploy module, and a test module that must not share literals.
+summary: Separate Django base, production and test settings, move deployment hosts and secrets to env, keep CONN_MAX_AGE at 0 on the transaction pooler, and guard production boots. Use this when settings overlays must not retain another environment's literals.
 stack: [django, postgres]
 tags: [settings, database, logging, security]
 requires: []
 related_skills: []
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Django settings modules, env boundaries, and the database pool
@@ -44,13 +44,13 @@ Test loads `.env.test` with `override=True` before the import, then the base loa
 
 ## What is env, and what the reference hardcodes
 
-Secrets and hosts come from the environment. Plan caps, delay distributions, and rank weights are code constants in the base module. Do not copy those caps here; `subscription-entitlements` owns them.
+For reuse, read secrets and deployment hosts from the environment. The reference still hardcodes some hosts, as described below. Plan caps, delay distributions, and rank weights are code constants in the base module. Do not copy those caps here; `subscription-entitlements` owns them.
 
 | Name | Where it belongs |
 | --- | --- |
 | `DJANGO_SECRET_KEY` | Env. Required when debug is off. |
 | `DJANGO_DEBUG` | Env on the base module. Production forces false. |
-| `DJANGO_ALLOWED_HOSTS` | Env, comma-separated. Empty on the laptop means every host. |
+| `DJANGO_ALLOWED_HOSTS` | Comma-separated. Base reads it or falls back to `*`; production resets the list to inline approvals/probe names, then appends env entries. Prefer env-only deployment names. |
 | `M2M_JWT_PUBLIC_KEY` | Env PEM. Newlines may be the two-character escape. |
 | `FIELD_ENCRYPTION_KEY` | Env. Required when debug is off. See `aes-gcm-field-encryption`. |
 | `SUPABASE_URL` | Env in every module. No host literal (P42). |
@@ -100,7 +100,36 @@ Production adds the bundled CA file to `sslrootcert` when the mode is `verify-ca
 
 The request path logs in as the application role from `supabase-rls-client-reads`, not as the owner and not as a role that bypasses RLS. A release job may set `SUPABASE_DB_ADMIN_USER`. Only then does the process use `SUPABASE_DB_ADMIN_HOST`, `SUPABASE_DB_ADMIN_PORT`, `SUPABASE_DB_ADMIN_SSLMODE`, and `SUPABASE_DB_ADMIN_PASSWORD` (falling back to `SUPABASE_DB_PASSWORD` when the admin password is unset). Do not apply the admin password unless the admin user is also set. The reference gets that pairing right and still hardcodes the non-admin user and host. Those two belong in the environment as well.
 
-Probe hosts `localhost` and `127.0.0.1` may be literals: the platform health check sends `Host: localhost`. Every other allowed host, including the name the tunnel presents, comes from `DJANGO_ALLOWED_HOSTS`. The reference hardcodes extra hosts beside the probe names. Move those to the env list.
+## Allowed hosts and overlay order
+
+Probe hosts `localhost` and `127.0.0.1` may be literals: the platform health check sends `Host: localhost`. Deployment hostnames should come from `DJANGO_ALLOWED_HOSTS`. The current source has two distinct stages:
+
+1. Base parses the comma-separated env value, stripping whitespace and dropping blank tokens. An empty/whitespace value uses the laptop `*` fallback. A nonblank commas-only value produces an empty list.
+2. Production imports base, then **replaces** `ALLOWED_HOSTS` with inline approved public/internal names and the two probe names. It then calls `ALLOWED_HOSTS.extend(...)` with the stripped nonblank env entries. It does not retain the imported list object or its fallback `*`, but it does reread and append env values, including `*` if explicitly supplied. The later production guard rejects that wildcard.
+
+Terraform removed `custom_hostnames`, its derived host list/output and `DJANGO_ALLOWED_HOSTS` injection. The production env extension remains implemented, but the current Terraform supplies no entries. An env-only adaptation needs both a settings change that removes inline deployment names and explicit env provisioning. An env change alone cannot remove the reference's inline approvals.
+
+Recommended production overlay after the base import (an adaptation, not the current implementation):
+
+```python
+import os
+
+def production_hosts(raw: str) -> list[str]:
+    hosts = [host.strip() for host in raw.split(",") if host.strip()]
+    if not hosts or any(
+        "*" in host or ":" in host or "/" in host or host.startswith(".")
+        or any(char.isspace() for char in host)
+        for host in hosts
+    ):
+        raise ValueError("DJANGO_ALLOWED_HOSTS must list exact deployment hostnames")
+    return list(dict.fromkeys(["localhost", "127.0.0.1", *hosts]))
+
+ALLOWED_HOSTS = production_hosts(os.environ.get("DJANGO_ALLOWED_HOSTS", ""))
+```
+
+This policy accepts exact DNS names or IPv4 hosts without schemes, ports or subdomain wildcards; extend it deliberately if IPv6 or wildcard matching is required. It is a configuration guard, not a full DNS syntax validator. [Django ALLOWED_HOSTS](https://docs.djangoproject.com/en/5.2/ref/settings/#allowed-hosts) documents host matching and validation through `get_host()`. Supply the origin host Django receives through the tunnel, which may differ from the client-facing hostname; routing/TLS verification belongs to `cloudflare-tunnel`.
+
+Setup order: provision the approved env list, choose the production module explicitly, apply the env-driven overlay, then inspect its final list and test probe/tunnel requests. Leave P42 and the other production guards in place.
 
 ## Middleware
 
@@ -170,6 +199,7 @@ The base module's laptop fallback for `SECRET_KEY` is a `django-insecure` litera
 - Admin password is applied only when `SUPABASE_DB_ADMIN_USER` is set.
 - `ENV` during the base import is not `test` yet. Short-circuits that must see `test` run after the test module assigns it.
 - Speech-style `load_dotenv(".env." + ENV)` does not name `.env.prod`. Read `django.conf.settings`.
+- Base settings alone do not establish production hosts. The reference resets the list, then extends it from env; Terraform no longer supplies that env. Remove inline approvals in the adaptation and verify the final overlay.
 
 ## Tests
 
@@ -180,6 +210,8 @@ The base module's laptop fallback for `SECRET_KEY` is a `django-insecure` litera
 - `is_test_env()` is false under the base module and true under the test module. The search embed path returns the constant vector only when it is true.
 - `DATABASES["default"]["CONN_MAX_AGE"]` is `0` and `OPTIONS["pool"]["min_size"]` is `0` in all three modules.
 - Production `sslmode` is `verify-full` and `sslrootcert` is set. Test `sslmode` is `disable`.
+- Isolate the reference host assignments with synthetic env input: empty env leaves inline approvals/probes, whitespace and blank tokens are stripped, a sentinel base list is replaced, and an explicit `*` reaches the production guard. This records source behavior, not the env-only goal.
+- For the recommended `production_hosts`, two reserved example hostnames with blanks/duplicates yield probe names plus distinct exact hosts. Empty, commas-only, wildcard, scheme, port and leading-dot entries raise. No deployment literals survive. Inject env directly; do not load real dotenv credentials in these tests.
 
 ## Checklist
 
@@ -191,4 +223,5 @@ The base module's laptop fallback for `SECRET_KEY` is a `django-insecure` litera
 - [ ] Middleware order is JWT, rate limit, security headers, CORS, common. No Django auth middleware.
 - [ ] Production refuses debug, `*` hosts, an empty or `django-insecure` secret, open CORS, and a missing JWT public key.
 - [ ] `ENV=test` is what mounts the mock stream and skips the embedding provider. Those routes are absent otherwise.
-- [ ] Allowed hosts other than `localhost` and `127.0.0.1` come from `DJANGO_ALLOWED_HOSTS`.
+- [ ] The reusable production overlay takes deployment hosts from `DJANGO_ALLOWED_HOSTS`, retains probe names and rejects missing/overbroad input. Env provisioning is explicit; the current Terraform has no host-list input.
+- [ ] Reference behavior is distinguished from that adaptation: production replaces base, still appends env entries, and cannot remove inline approvals through env alone.

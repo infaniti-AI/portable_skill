@@ -7,7 +7,7 @@ tags: [realtime, auth, database]
 requires: [supabase-magic-link-auth, supabase-rls-client-reads]
 related_skills: []
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Supabase Realtime postgres_changes with an httpOnly session
@@ -20,7 +20,7 @@ Packages: `@supabase/supabase-js` 2.x. The session cookie client is the one from
 
 | Piece | Role |
 | --- | --- |
-| Publication `supabase_realtime` | Postgres only sends changes for member tables. App migrations do not add the table. |
+| Publication `supabase_realtime` | A conditional migration adds the child table after creation when the publication exists. Verify membership on the target database. |
 | `authenticated` SELECT policy | Realtime delivers an INSERT only when this role could `SELECT` the new row. |
 | `app_api` | Inserts the row. Its `USING (TRUE)` policy does not widen what the browser receives. |
 | Server token action | Returns `session.access_token` after the cookie client has run. Never returns the refresh token. |
@@ -58,21 +58,60 @@ Local Auth config sets `jwt_expiry` to 3600 seconds. Keep the live window shorte
 
 ## Database
 
-Hosted Supabase already has the publication `supabase_realtime`. Membership is separate from `CREATE TABLE`. A catalog of the app migrations shows that publication with an empty table list, so a database built only from those migrations will accept the client subscribe and deliver nothing.
+Membership is separate from `CREATE TABLE`. The current reference table migration ends with conditional publication SQL, after all model creation and constraints. It adds the child table only when `supabase_realtime` exists and that schema/table is not already a member. Plain local Postgres without the provider publication takes no action; this migration does not create the publication or a Realtime service. Supabase documents both the dashboard toggle and SQL membership in [Postgres Changes setup](https://supabase.com/docs/guides/realtime/postgres-changes).
 
-Add the child table. Do not drop the publication: a reset removes every other member.
+Generic forward SQL, placed after `CreateModel` for `item_notes`:
 
 ```sql
-ALTER PUBLICATION supabase_realtime ADD TABLE public.item_notes;
+DO $publication$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime'
+      AND schemaname = 'public' AND tablename = 'item_notes'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.item_notes;
+  END IF;
+END
+$publication$;
+```
 
+Its reverse removes only that table's membership when present:
+
+```sql
+DO $publication$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime'
+      AND schemaname = 'public' AND tablename = 'item_notes'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime DROP TABLE public.item_notes;
+  END IF;
+END
+$publication$;
+```
+
+`ADD TABLE` and `DROP TABLE` preserve other members. Avoid `SET TABLE`, which replaces membership, and never drop/recreate the publication as a single-table repair. Run this as an authorized migration role: changing the publication requires ownership, and adding the table also requires table ownership. See [PostgreSQL ALTER PUBLICATION](https://www.postgresql.org/docs/current/sql-alterpublication.html).
+
+The reverse does not track whether forward SQL added the membership or found it already present. It removes the target membership in either case. Review that effect before rollback; unapplying the whole table migration also reverses model creation and is not a membership repair.
+
+### Database setup and verification
+
+1. Apply extension/role setup, then table creation followed by the conditional membership SQL, then client grants/RLS. Keep these dependencies explicit.
+2. On an existing database, inspect membership and migration history. An already-recorded edited migration will not run its appended SQL; `--fake` also skips it (P11, `migration-safety`). Add a reviewed successor migration to repair missing membership rather than replaying table creation.
+3. If the publication is created after a local install, the earlier no-op does not rerun automatically. Apply a membership migration once the publication exists.
+4. Verify actual membership, grants and own-parent policies before testing subscriber delivery:
+
+```sql
 SELECT schemaname, tablename
 FROM pg_publication_tables
 WHERE pubname = 'supabase_realtime';
 ```
 
-The same membership is the Database → Publications toggle. Confirm with the query above. Dashboard state is not in the migrations.
-
-> NOTE: unverified whether a hosted project was toggled in the dashboard outside the migrations. The client still requires the table to be a member.
+Expect `public.item_notes` on the provider database. A successful migration or `SUBSCRIBED` status alone does not prove delivery. The current graph expresses intended membership; no deployed dashboard state or database history is inferred from it.
 
 `authenticated` needs `SELECT` on `item_notes` and on the parent it joins. Writes stay with `app_api`. Full role setup is `supabase-rls-client-reads`. The child table has no `user_id`; the policy follows the parent.
 
@@ -236,13 +275,22 @@ Per-user detail that changes when a note is inserted is not a `"use cache"` entr
 
 - **P22.** Session cookies are httpOnly, so the anon Realtime client has no user JWT until `setAuth(token)`. Persistence stays off.
 - **P18.** The INSERT handler refetches. It does not serve a cached detail document, and it does not render `payload.new` as the note body.
-- Empty publication. Subscribe only after `pg_publication_tables` lists `item_notes`.
+- Missing membership. Conditional SQL follows table creation; it is a no-op without the publication. Verify `pg_publication_tables`, including after history alignment or a late publication setup (P11).
+- Scoped rollback. Remove only the target membership. Reverse SQL also removes a membership that predated forward execution; preserve other tables and review rollback ownership.
 - Filter string. Reject any parent id that is not a UUID before building `item_id=eq.${itemId}`.
 - Stale open. The attempt counter drops a token fetch that finished after forget or a newer open.
 - Shared token lifetime. Live window stays under the remaining access-token lifetime, or `setAuth` runs again with a new token.
 - Logs. Parent id and channel status are safe. The access token is not.
 
 ## Tests
+
+On disposable databases, test publication setup separately from browser mocks:
+
+- Publication absent: forward and reverse SQL succeed without creating it.
+- Publication present, target absent: forward adds `public.item_notes` and preserves another member; a second forward is a no-op.
+- Target already present: forward is a no-op; reverse removes the target, preserves another member, and a second reverse is a no-op. This also demonstrates the rollback ownership limitation.
+- Fresh migration graph: target creation precedes publication SQL, then grants and own-parent RLS are applied. A recorded older table migration does not execute appended SQL; a successor repair supplies the missing membership.
+- With subscriber A's JWT, an insert under A's parent produces an event and an insert under B's parent does not. Browser mocks cannot prove this database/RLS boundary.
 
 Mock the server action and a channel object that records `setAuth`, the filter, and `removeChannel`.
 
@@ -261,7 +309,9 @@ Mock the server action and a channel object that records `setAuth`, the filter, 
 
 ## Checklist
 
-- [ ] `item_notes` is in `supabase_realtime` (`pg_publication_tables`), and the publication was not dropped.
+- [ ] Conditional publication SQL follows table creation; local databases without the publication safely skip it.
+- [ ] `pg_publication_tables` lists `public.item_notes` on the provider database. Recorded/faked migration history is not proof of membership (P11).
+- [ ] Forward/reverse preserve other members. Reverse removes only the target, including a pre-existing membership; table-migration rollback is reviewed separately.
 - [ ] `authenticated` has `SELECT` and an own-parent policy. `anon` has no grant. Inserts go through `app_api`.
 - [ ] Browser client refuses session persistence, refresh, and URL detection.
 - [ ] The token action calls `getUser()` then returns only `access_token`. Refresh token stays in the cookie.
