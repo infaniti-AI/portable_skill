@@ -7,7 +7,7 @@ tags: [orm, queries, models, privacy]
 requires: [supabase-rls-client-reads, aes-gcm-field-encryption]
 related_skills: []
 status: stable
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Owner-scoped Django queries, denormalized filters, and a stored streak
@@ -99,13 +99,18 @@ The catalog page is offset. The handler rejects `page < 1` and a page size outsi
 
 ## Denormalized filter columns (P41)
 
-A catalog page that filtered two labels stored only inside `metadata` could not use an index. The migration adds the columns, backfills them, and leaves the JSON keys in place:
+A catalog page that filtered two labels stored only inside `metadata` could not use an index. Promote such filter fields into indexed columns. For an existing populated table, the reusable migration pattern is expand, copy, verify, then switch readers/writers; retain old JSON keys until older processes are gone. The historical additive migration followed that pattern. It has since been removed from the reference graph.
+
+The current three-file graph creates the indexed labels directly in its table snapshot. Both fields are `CharField(max_length=255, blank=True, default="", db_index=True)`. There is no `RunPython` label copy in that graph. Fresh rows use column defaults or explicit writes. Existing JSON-only labels are not copied by rewriting or faking the snapshot; an already-recorded snapshot does not rerun its added fields either. Schema/history transition checks belong to `migration-safety` (P11).
+
+For a separate backfill on a legacy database, this generic example copies normalized values and preserves JSON. It is a migration pattern, not code that still runs in the reference graph. Run it after adding the columns and before relying on them for filtering; use historical models and the schema editor's database alias as [Django RunPython](https://docs.djangoproject.com/en/5.2/ref/migration-operations/#runpython) requires:
 
 ```python
 def backfill_labels(apps, schema_editor):
-    Profile = apps.get_model("app", "Profile")
+    Profile = apps.get_model("items", "Profile")
+    profiles = Profile.objects.using(schema_editor.connection.alias)
     batch = []
-    for row in Profile.objects.all().iterator(chunk_size=200):
+    for row in profiles.all().iterator(chunk_size=200):
         meta = row.metadata if isinstance(row.metadata, dict) else {}
         category = str(meta.get("category") or "").strip()[:255]
         function = str(meta.get("function") or "").strip()[:255]
@@ -115,17 +120,17 @@ def backfill_labels(apps, schema_editor):
         row.function = function
         batch.append(row)
         if len(batch) >= 200:
-            Profile.objects.bulk_update(batch, ["category", "function"])
+            profiles.bulk_update(batch, ["category", "function"])
             batch = []
     if batch:
-        Profile.objects.bulk_update(batch, ["category", "function"])
+        profiles.bulk_update(batch, ["category", "function"])
 ```
 
-Both fields are `CharField(max_length=255, blank=True, default="", db_index=True)`. The reverse of the data migration is `RunPython.noop`.
+Attach this function to a new `RunPython` after the `AddField` operations (or a later controlled data step). A no-op reverse keeps copied data; it does not restore a pre-copy state. The example assumes JSON is authoritative and writes are paused or compatible during the copy. It is repeatable with unchanged input, but can overwrite newer column values if run after independent column writes. For large tables, plan bounded transactions, restart checkpoints and write coordination rather than assuming batches remove locking or race risks.
 
 The list query filters `category__in` and `function__in`. It does not use `metadata__contains`. Current writes copy the labels onto the columns and pop those two keys out of the JSON before insert. An update still reads a leftover JSON value when the column argument is omitted, then pops the keys before save. The response serializer pops them again and returns the columns. Prompt assembly copies the columns into an in-memory metadata dict so a reader that still looks up the keys sees the column value. That copy is not a write.
 
-Dropping the JSON keys in the same deploy as the new readers breaks a process that has not picked up the column code. The migration keeps the keys. The application pop happens on the write path that already knows the columns.
+Dropping the JSON keys while old readers or writers still depend on them breaks compatibility. The historical copy retained them; the current snapshot contains no copy or cleanup. The application pop happens on a write path that already knows the columns. A rolling adaptation needs compatible/dual writes or a coordinated switch before enabling cleanup. An update fallback does not repair untouched rows used by column-only filters.
 
 ## Stored streak (P40)
 
@@ -138,7 +143,7 @@ The preference row, primary key `user_id` (uuid), holds:
 | `last_write_time` | null | That same create, unless the new timestamp is before the stored day |
 | `first_write_time` | null | The first create only |
 
-The migration adds the four columns with those defaults. It does not scan existing items. Until the next create, the stored streak stays 0 and the timestamps stay null.
+The current table snapshot creates these four columns with zero/null defaults. The former additive migration also used defaults without scanning existing items, but that file is gone. Current migrations contain no historical streak reconstruction. A newly created preference starts at those defaults until a create advances it; existing populated counters are not reset by a history rewrite. An older database missing the columns needs a reviewed forward schema change, not a fake declaration that they exist (`migration-safety`).
 
 Advance rules, using the stored clock digits. `tzinfo` is stripped and never converted:
 
@@ -159,14 +164,15 @@ Delete refills all-time counts and the activity grid (the last 21 calendar dates
 
 1. Confirm the API role's policy is allow-all (`supabase-rls-client-reads`) and that every repository method receives the subject.
 2. Match `user_id` to the column type. Text columns get `str(subject)`. UUID columns get `UUID(str(subject))` after a parse that returns 400 on failure (`m2m-jwt-service-auth`).
-3. Keep filterable facts in columns. Add the column and the index, backfill from JSON in that migration, and leave the old key until every running process reads the column.
-4. Add the streak columns with defaults and no backfill. Call the advance function only from the create path.
+3. Keep filterable facts in columns. On an existing table, expand columns/indexes, coordinate writes, backfill JSON, verify values, then switch filters. Retain old keys until compatible readers/writers are deployed. On a fresh install, create columns directly; do not claim that this copies legacy data.
+4. Create the streak columns with defaults when no historical reconstruction is intended. Preserve existing counters during upgrades; repair missing schema explicitly. Call the advance function only from the create path.
 5. Load relations with `select_related` or `Prefetch`. Count with `values().annotate()`, not a query per parent.
 
 ## Failure prevention
 
 - **P40.** Store current, longest, last write, and first write. Advance them only when a new item is created. A display of 0 after a gap is not written back. Delete leaves the four columns alone. Date keys use the stored clock digits. Do not serve `compute_streaks` as the displayed current streak: a missing item today zeros it even when yesterday has one.
-- **P41.** Page and filter on indexed columns. Backfill from JSON in the same migration and keep the JSON keys until writers that know the columns are the only writers. The list query uses `category__in` / `function__in`.
+- **P41.** Page and filter on indexed columns. A live JSON-to-column transition needs an explicit copy and compatibility plan; a default empty string and a rewritten initial snapshot supply neither. Keep JSON keys until compatible readers/writers are the only processes. The list query uses `category__in` / `function__in`, so legacy JSON alone cannot satisfy it.
+- **P11 / P40.** Current columns are part of a three-file creation graph; the removed additive files and label `RunPython` do not execute. Compare actual schema, stored counters and label data before aligning history. Do not reset counters or infer a backfill from a fake (`migration-safety`).
 - The API role sees every row. Put `user_id` in the same query as the primary key.
 - Decrypt after the fetch. Uniqueness of a private title is a per-user Python compare.
 - A `filter()` on a prefetched related manager is a new query per parent. Put the filter inside `Prefetch`.
@@ -178,14 +184,17 @@ Streak unit tests, no database: the first write is 1; the same day keeps the cou
 
 Query tests: a goal list uses one prefetch for non-deleted items (assert the query count, and that `filter()` is not chained on the related manager). An item page with a cursor returns rows strictly older than the cursor pair. A catalog page with both label lists uses OR. A second user cannot read the first user's item when `user_id` is in the lookup. Two users may store the same goal title; one user may not have two active goals whose decrypted titles match. Encrypting the same title twice does not make the ciphertext equal.
 
-Migration: new preference columns default to 0 and null and do not scan items. The label migration copies JSON into the columns and leaves the keys.
+Migration acceptance: the fresh snapshot creates indexed label columns with empty defaults and preference counters/timestamps with zero/null defaults; it has no `RunPython` label copy or item scan. A fixture with legacy JSON labels and empty columns remains unchanged by fake alignment, so filtering cannot be declared repaired. Rehearse existing-schema upgrades separately (`migration-safety`).
+
+For the proposed backfill, test dict and non-dict metadata, missing/empty labels, whitespace and length bounds, more than one batch, unchanged-row skipping, a second run with unchanged inputs, retention of JSON keys, and the selected database alias. Verify the JSON-authoritative assumption before running it against rows with newer column values. These tests validate the example pattern; they are not evidence that the deleted migration ran on a deployed database.
 
 ## Checklist
 
 - [ ] Every API query includes the token subject, in the same lookup as the id.
 - [ ] Text owner columns receive `str(subject)`. UUID owner columns receive a `UUID`.
 - [ ] Filters and sorts use plaintext columns. Private text is decrypted after the fetch.
-- [ ] Label columns are indexed, backfilled, and left duplicated in JSON until old processes are gone.
+- [ ] Label columns are indexed. Existing JSON data has an explicit verified copy path and compatible writes; old keys remain until old processes are gone (P41).
+- [ ] Fresh creation, historical backfill and existing-database history alignment are distinguished. Current graph has no label `RunPython`; stored counters are preserved (P11/P40).
 - [ ] Streak columns advance only on create. A gap displays 0 without writing 0. Delete does not touch them.
 - [ ] Relations use `select_related` or `Prefetch`. Counts use one grouped query.
 - [ ] Item pages are a `(datetime, id)` keyset. The catalog page bounds page size and orders by a stored counter or by name.

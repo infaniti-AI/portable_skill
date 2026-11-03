@@ -7,7 +7,7 @@ tags: [migrations, deploy, ci]
 requires: []
 related_skills: []
 status: stable
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Expand-only migration checks before deploy
@@ -30,7 +30,7 @@ flowchart TD
   dispatch --> migrateOnly[migrate only, no image]
 ```
 
-Django applies every file that is not recorded in `django_migrations`. Reordering or replacing an applied file makes the next migrate run SQL against tables that already exist (P11). The checker does not catch that. The file layout and `--fake` rules below are what prevent it.
+Django plans migrations from dependency names and applied records in `django_migrations`; those records do not checksum a file's contents. Editing a recorded file does not rerun its new SQL. Losing records can instead replay table creation against existing tables (P11). The checker does not compare live schema or prove history equivalence. The layout and transition checks below address that separate problem.
 
 ## What the checker flags
 
@@ -123,7 +123,7 @@ fi
 python manage.py check_migration_safety --names "${names[@]}"
 ```
 
-`app="${f%%/*}"` is correct only when the file is `{app_label}/migrations/{name}.py`. A nested path takes the wrong label. `--diff-filter=AM` is added and modified. A rename can show up as `R` and skip the check. Do not rename an applied migration. Deleting a file is not inspected; removing an applied file does not drop the column, and Django will refuse to start if the graph is broken.
+`app="${f%%/*}"` is correct only when the file is `{app_label}/migrations/{name}.py`. A nested path takes the wrong label. `--diff-filter=AM` is added and modified. A rename can show up as `R` and skip the check. Do not rename an applied migration. Deleting a file is not inspected; removing an applied file does not drop the column. A dangling dependency breaks the graph, while a rewritten graph can load and still omit necessary work on existing databases.
 
 `--names items.0008_add_flag` splits on the first dot, imports `{app_label}.migrations.{name}`, and constructs `Migration(name, app_label)`. The ancestor walk skips dependency markers `__setting__`, `__first__`, and `__latest__`, replays the rest into a `ProjectState`, and passes that state in. A spec with no dot is a command error.
 
@@ -169,28 +169,50 @@ Production settings require `DJANGO_SECRET_KEY` and `M2M_JWT_PUBLIC_KEY` at impo
 
 `setup_langgraph_persistence` is the graph-table command in `langgraph-postgres-persistence`. It is not a Django migration. It runs as the admin role and then grants `app_api`. A failed safety check never reaches it.
 
-## File layout (P11)
+## File layout and history transitions (P11)
 
-Keep the applied history stable. The current graph is four files, in order:
+Keep applied history stable for ordinary releases: add a successor file rather than editing, deleting, or renaming a recorded migration. The current reference graph has **three files**, represented here by generic names:
 
-1. Extensions and roles. Schema `extensions`, `vector` and `pgcrypto` installed or moved there, roles `anon`, `authenticated`, and `service_role` (`NOLOGIN`; `service_role` is `BYPASSRLS`), and `app_api` (`LOGIN`, `NOBYPASSRLS`, `search_path` `public, extensions`). An event trigger enables RLS and grants `app_api` on later `CREATE TABLE`. The password is not in the file. This file runs before the tables so the trigger fires during the next migration.
-2. Tables. Depends on file 1. The first operation is `SET search_path TO public, extensions` so an unqualified `vector(384)` resolves. Then `CreateModel`. The docstring says an existing database already has this schema and a fresh database runs it forward.
-3. Grants and RLS policies for `authenticated`. Depends on file 2. Policy SQL and `GRANT` pass the checker. The unit test runs `--names` on this file and expects no findings.
-4. One additive boolean, `default=False`. `AddField`. Not a finding.
+| Order | Responsibility | Dependency |
+| --- | --- | --- |
+| `0001_extensions` | Extensions/schema, roles, auto-RLS/grant event trigger before tables | None in this app |
+| `0002_tables` | Session search path, model creation with current fields/indexes/constraints, then conditional Realtime membership | File 1 |
+| `0003_rls` | Client grants and policies after tables exist | File 2 |
 
-An older note said to keep three files. The code now has the fourth, and it is expand-safe. Do not squash the four back into a new initial migration on a database that has recorded these names.
+The table snapshot now includes fields that previously arrived in later additive files: a boolean with `default=False`, stored counters with zero/null defaults, and indexed text labels with empty-string defaults. Those old files are absent. No `replaces` declaration or automatic transition operation accompanies this rewrite. It is a manually coordinated history transition; the current repository cannot prove which schema or records any deployed database has.
 
-There is no `--fake` step in CI or CD. `migrate --noinput` executes every unrecorded file. Use fake only as an operator step when the schema already matches a rewritten history:
+The publication SQL runs at the end of file 2, after the target table exists. It adds only that table when the provider publication exists and membership is absent; without that publication it is a no-op. Reverse SQL removes only that membership when present. Faking file 2 skips this SQL too, and a recorded old file 2 will not execute its newly appended SQL. Verify publication membership separately after any history transition. Client delivery and permissions are `supabase-realtime-postgres-changes`.
+
+### Fresh install versus existing database
+
+| Observed state | Consequence / next step |
+| --- | --- |
+| Empty database and no app history | Run the current three-file graph forward, then verify tables, indexes, RLS/grants and conditional publication membership |
+| Old table migration already recorded | Django skips its edited contents; missing fields, indexes or publication membership need an explicit forward repair |
+| Existing tables but missing migration records | Normal migrate may issue duplicate `CREATE TABLE`; stop and compare schema/history before changing records |
+| Partially upgraded schema or legacy JSON-only labels | A fake cannot supply missing SQL or data work; complete reviewed repairs/backfill before declaring equivalence |
+
+The removed label data migration used to copy JSON keys onto indexed columns while retaining the keys. Current table creation contains no `RunPython` replacement. It does not copy any existing JSON values, and creating a column with an empty default is not a backfill. The generic expand/backfill pattern and its tests are in `django-models-and-queries`.
+
+### Transition procedure
+
+1. Inventory every environment's running revisions, disk graph and applied records. Take a restorable schema/data/history backup and test restoration on a disposable clone. Preserve the old release artifact for comparison.
+2. Inspect both old and new operations and dependencies. Compare actual tables, field types, defaults/nullability, indexes/constraints, extension schemas, roles/grants/policies, triggers and publication membership. Separately compare data postconditions such as populated label columns. Model state alone does not represent every `RunSQL` effect.
+3. Prefer Django's staged squash workflow for a planned squash: ship replacement metadata alongside old files, upgrade every environment, then remove old files and update dependencies in a later release. The manual three-file reference rewrite does not implement that workflow. See [Django squashing migrations](https://docs.djangoproject.com/en/5.2/topics/migrations/#squashing-migrations).
+4. Rehearse fresh install and each supported existing-history path on disposable databases. A matching final model state and a clean checker result are insufficient if SQL/data postconditions differ.
+5. For a manual history alignment, define the exact per-environment record changes only after equivalence or required forward repairs are demonstrated. Serialize migration/deploy operations so another runner or an older artifact cannot use the interim history. Never erase the whole migration table as a general cleanup step.
+6. Only then, if a specific unrecorded migration's effects already exist, an operator may mark that migration applied with `--fake`. Review its complete dependency plan first. Fake changes history without SQL; it must not skip missing grants, Realtime membership or a data backfill. There is no fake step in reference CI/CD. [Django migrate options](https://docs.djangoproject.com/en/5.2/ref/django-admin/#cmdoption-migrate-fake) distinguish fake history updates from execution; `--fake-initial` checks table names, not full schema equivalence.
+7. Verify history, migration plan, actual schema/data and application reads/writes after alignment. Ship the matching code artifact. Rolling back to old migration files after their records were removed can attempt to add already-existing columns; a history transition needs its own tested recovery procedure.
+
+Read-only review commands, using a generic app label and the chosen admin connection:
 
 ```bash
-python manage.py migrate items 0001_extensions --fake
-python manage.py migrate items 0002_tables --fake
-python manage.py migrate items 0003_rls --fake
+python manage.py showmigrations items --plan
+python manage.py migrate items --plan
+python manage.py sqlmigrate items 0002_tables
 ```
 
-Fake a later file only when that column or table is already present. Never fake a file whose SQL has not been applied. Never re-run file 2's `CreateModel` on a database that already has the tables. Fresh environments run `migrate` forward, including the integration job that migrates a local database and then runs `setup_langgraph_persistence`.
-
-Do not edit a file that production has applied. Add a new file. Do not reorder names.
+These commands explain the disk graph/planned SQL. An empty plan does not prove the live schema equals an edited file. The deployed database state was not inspected for this module.
 
 ## Contract follow-up
 
@@ -208,9 +230,11 @@ Hermetic, no database, against `findings_for_operation` and `check_migration_saf
 - The same alter, when the old field is already `null=False`, produces none.
 - `RunSQL` containing `DROP COLUMN` produces one finding. A `GRANT` produces none.
 - `SeparateDatabaseAndState` whose database operation is `RemoveField` produces that finding.
-- `--names` on the table snapshot and on the RLS migration prints `No destructive migrations.`
+- `--names` on the current table snapshot (including conditional publication SQL) and on the RLS migration prints `No destructive migrations.` That result is an operation check, not a history-transition certification.
 
 Add a plan-path test the reference does not have: an unapplied `RemoveField` fails against a database that has not applied it, and the same migration is ignored once it is in `django_migrations`. A backwards plan entry is a finding.
+
+For P11, add disposable-database acceptance tests beyond the reference unit suite: fresh three-file install; already-recorded old table migration with a missing new column; existing tables with missing history; absent/present publication and existing membership; preserved JSON labels needing a separate backfill. Assert real schema/data and membership, not just the recorded leaf. Verify that a fake skips all SQL and that replaying an old deleted additive migration would be unsafe after record removal. No deployed database repair is implied by these tests.
 
 ## Checklist
 
@@ -221,6 +245,8 @@ Add a plan-path test the reference does not have: an unapplied `RemoveField` fai
 - [ ] `migrate` is followed by `check --deploy` and `setup_langgraph_persistence`.
 - [ ] Expand files (add table, add column, NOT NULL with a default, grants, policies) go out with the new image.
 - [ ] Drop, rename, and NOT NULL without a default wait until the new revision is the only one, then dispatch with the allow flag and no image update.
-- [ ] Applied migration files are not renamed, reordered, or squashed. A database that already matches a rewritten history is faked, not re-executed.
+- [ ] Ordinary changes add successor files. Any squash/history transition has backups, per-environment schema/data/history comparison, clone rehearsal, serialized deploys, and a matching code artifact (P11).
+- [ ] Fake is limited to verified existing effects; missing columns, labels, grants or publication SQL are repaired first. No blanket deletion of history or reliance on table names alone.
+- [ ] The current graph has three files. Existing recorded files do not rerun new contents, and the removed label backfill is not claimed to execute.
 - [ ] `RunPython`, `DROP CONSTRAINT`, and `DROP INDEX` are reviewed even though the checker allows them.
 - [ ] `--allow-destructive` is absent on the release event.
