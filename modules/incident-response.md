@@ -14,11 +14,13 @@ updated: 2026-11-06
 
 ## Project and handoff
 
-Use the trusted project config for resource references and `incident_response.repositories`. Repository metadata can give a `path_env`, `default_branch` and test commands as argument arrays. A shared project JSON may also contain Terraform alert settings; no duplicate incident manifest is needed. Resolve directory placeholders through the execution environment, not shell evaluation of email text. Keep credentials outside the config.
+Resolve the handoff's `project_name` through the configured project directory and read that project's JSON. The handoff does not carry a config path or repository information. Use resource references and `incident_response.repositories`; the shared project JSON may also contain Terraform alert settings without needing a duplicate incident manifest.
+
+Repository metadata includes the Git `url`, `directory`/`path_env`, development/default branches and test commands. Clone missing source repositories into the configured path or existing workspace convention; verify an existing remote and inspect local changes before fetching refs. Preserve unrelated work, prepare dependencies from repository instructions and use its development workflow or an isolated checkout. Keep credentials outside the config.
 
 A mail body/subject or alert link can start an investigation. Incident ID, resource and exact event time are optional inputs, to be recovered through source lookups. Match against trusted project context before accessing resources. Keep mail receipt time, provider event time and approximate search windows distinct. If available sources cannot resolve ambiguity, ask only for the remaining detail.
 
-Correlate repeated deliveries using message IDs and verified provider incident IDs. The same rule can have distinct incidents; do not collapse episodes solely by title. Continue the active task on recovery notifications and assess whether diagnosis or repair is still warranted.
+Grok maintains mail/task/incident/PR/progress/result associations through the existing task entry point. A handoff message_id, when present, comes from the email Message-ID header; the task entry point supplies its own task/session identifier. Report source incident IDs recovered during investigation and subsequent progress/results to that entry point. Correlate repeated deliveries using mail identifiers and verified provider incident IDs. The same rule can have distinct incidents; do not collapse episodes solely by title. Continue the active task on recovery notifications and assess whether diagnosis or repair is still warranted.
 
 ## Read-only evidence
 
